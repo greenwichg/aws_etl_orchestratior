@@ -1,0 +1,19 @@
+{
+  "source": ["aws.s3"],
+  "detail-type": ["Object Created"],
+  "detail": {
+    "bucket": {
+      "name": ["nyl-invgai-dev-anaplan"]
+    },
+    "object": {
+      "key": [
+        {
+          "prefix": "data/in/"
+        },
+        {
+          "prefix": "config/"
+        }
+      ]
+    }
+  }
+}
