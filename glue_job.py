@@ -717,6 +717,39 @@ def drop_views(config: dict, redshift_conn: dict, client, log):
                 'definition': d['definition']
             }
 
+    if not v_config:
+        log.error("No configuration found for the target table")
+        raise ValueError("view parameters are empty")
+    
+    view_name = v_config['view_name']
+    source_table = v_config['source_table']
+    schema_name = v_config['schema_name']
+    definition = v_config['definition']
+    
+    ddl = f"""DROP VIEW IF EXISTS {schema_name}.{view_name}"""
+
+    
+    try:
+        resp = client.execute_statement(
+            WorkgroupName=redshift_conn['workgroup_name'],
+            Database=redshift_conn['database'],
+            Sql=ddl,
+            SecretArn=redshift_conn['secret_arn']
+        )
+        stmt_id = resp["Id"]
+
+while True:
+        desc = client.describe_statement(Id=stmt_id)
+        if desc["Status"] == "FINISHED":
+            #log.info(f"Successfully created view '{view_name}'")
+            break
+        if desc["Status"] in ("ABORTED", "FAILED"):
+            raise RuntimeError(desc.get("Error", "view creation failed"))
+        time.sleep(1)
+    return desc
+    except Exception as e:
+        print(f"Failed to drop view '{view_name}' with error: {e}")
+        raise
 # ===============================================================
 # AUDIT TABLE UPDATE
 # ===============================================================
