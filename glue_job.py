@@ -333,15 +333,25 @@ def create_new_redshift_table(config: dict, redshift_conn: dict, df, client, log
 
 @retry_on_exception(max_attempts=3, delay_seconds=180, exceptions=(Exception,))
 def alter_redshift_table(config: dict, redshift_conn: dict, df, redshift_df, client, log, spark):
-    redshift_df = read_redshift_table_schema(config, redshift_conn, spark, client)
-    if set(df.columns) != set(redshift_df.columns):       
+    df = read_redshift_table_schema(config, redshift_conn, spark, client)
+    if set(df.columns) != set(redshift_df.columns):
+        #drop view
+        drop_views(config, redshift_conn, client, log)
+        
         target_cols = [c.name for c in redshift_df.schema.fields]
+        missed_cols = []
         for colf in df.schema.fields:
             if colf.name not in target_cols:
+                missed_cols.append(colf.name)
                 rtype = _spark_to_redshift_type(colf.dataType)
                 sql = f"ALTER TABLE {redshift_conn['schema_name']}.{config['target_table']} ADD COLUMN {colf.name} {rtype};"
                 execute_sql(sql, redshift_conn, client)
-
+        if missed_cols:
+            log.info(f"columns: {missed_cols}' are added successfully")
+            desc = create_views(config, redshift_conn, client, log)
+            if desc['Status'] == 'FINISHED':
+                log.info("view is refreshed successfully")
+                
 # VARCHAR length management -----------------------------------------------------
 
 def get_metadata(config: dict, redshift_conn: dict, client) -> dict:
