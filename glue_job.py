@@ -773,6 +773,17 @@ def check_datatype_matching(redshift_df, df, log):
         if field.name in redshift_cols:
             src_type = type(field.dataType)
             tgt_type = type(redshift_cols[field.name])
+
+            non_null_count = df.select(count(field.name)).collect()[0][0]
+            if issubclass(src_type, non_numeric_types) and issubclass(tgt_type, numeric_types) and non_null_count != 0:
+                msg = (
+                    f"Datatype mismatch for column '{field.name}': "
+                    f"source={src_type.__name__}, target={tgt_type.__name__}"
+                )
+                raise Exception(msg)
+
+#====================================================
+# ABLE_UPDATE
 # ===============================================================
 # AUDIT TABLE UPDATE
 # ===============================================================
