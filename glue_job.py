@@ -20,8 +20,7 @@ from pyspark.sql.types import (
     IntegerType, FloatType, DoubleType, LongType, DecimalType,
     BooleanType, TimestampType, DateType, BinaryType,
     LongType, DecimalType, BooleanType, DataType,
-    TimestampType, BinaryType, ArrayType,
-    MapType
+    TimestampType, BinaryType, ArrayType, MapType
 )
 
 # ===============================================================
@@ -67,12 +66,9 @@ class LogBuffer:
         print(f"Logs exported to s3://{bucket}/{key}")
         return f"s3://{bucket}/{key}"
 
-
 #======================================
 # retry logic
 #===================================
-
-
 def retry_on_exception(max_attempts=3, delay_seconds=300, exceptions=(Exception,)):
     def decorator(func):
         @functools.wraps(func)
@@ -115,7 +111,6 @@ def retry_on_exception(max_attempts=3, delay_seconds=300, exceptions=(Exception,
 # ===============================================================
 # GLUE INIT
 # ===============================================================
-
 def initialize_glue(job_name: str):
     sc = SparkContext.getOrCreate()
     glue_context = GlueContext(sc)
@@ -127,7 +122,6 @@ def initialize_glue(job_name: str):
 # ===============================================================
 # DATAFRAME HELPERS
 # ===============================================================
-
 def _clean_colname(name: str) -> str:
     name = name.lower()
     name = re.sub(r"[^a-z0-9]", "_", name)
@@ -190,7 +184,6 @@ def read_csv_file(config: dict, spark):
 # ===============================================================
 # REDSHIFT DATA API UTILITIES
 # ===============================================================
-
 def _poll_statement(client, stmt_id: str, ctx: str, sleep_s: float = 0.5):
     while True:
         desc = client.describe_statement(Id=stmt_id)
@@ -216,7 +209,6 @@ def execute_sql(sql: str, redshift_conn: dict, client):
 # ===============================================================
 # SCHEMA DISCOVERY & HARMONIZATION
 # ===============================================================
-
 def read_redshift_table_schema(config: dict, redshift_conn: dict, spark, client):
     schema_name = redshift_conn['schema_name']
     table_name = config['target_table']
@@ -353,7 +345,6 @@ def alter_redshift_table(config: dict, redshift_conn: dict, df, redshift_df, cli
                 log.info("view is refreshed successfully")
 
 # VARCHAR length management
-
 def get_metadata(config: dict, redshift_conn: dict, client) -> dict:
     sql = dedent(f"""
         SELECT column_name, data_type, character_maximum_length
@@ -389,7 +380,6 @@ def alter_varchar_columns(config: dict, redshift_conn: dict, df, client, log):
     int_cols = []
     
     #Handle string length
-    
     for f in df.schema.fields:
         if isinstance(f.dataType, StringType):
             string_cols.append(f.name)
@@ -470,8 +460,6 @@ for colname in int_cols:
             if desc['Status'] == 'FINISHED':
                 desc = execute_sql(rename_sql, redshift_conn, client)
 
-
-    
     int_altered_cols.append({"column_name": colname, "current_datatype": curr_dtype, "new_datatype": new_type})
 
 if int_altered_cols:
@@ -479,10 +467,8 @@ if int_altered_cols:
     desc = create_views(config, redshift_conn, client, log)
     if desc['Status'] == 'FINISHED':
         log.info("view is refreshed successfully")
-    
 
 # Fill missing columns to match target layout ----------------------------------
-
 def get_default_value(dtype):
     if isinstance(dtype, StringType):
         return ""
@@ -515,7 +501,6 @@ def fill_missing_columns(df, redshift_df):
 # ===============================================================
 # STAGING TABLE + COPY
 # ===============================================================
-
 def create_staging_table(config: dict, redshift_conn: dict, staging_table_name: str, client, log):
     staging = staging_table_name
     log.info(f"Creating staging table: {staging}")
@@ -568,7 +553,6 @@ def copy_to_redshift(s3_staging_path: str, redshift_conn: dict, staging_table_na
 # ===============================================================
 # MERGE (delete+insert) with transaction
 # ===============================================================
-
 @retry_on_exception(max_attempts=3, delay_seconds=300, exceptions=(Exception,))
 def run_merge(config: dict, redshift_conn: dict, staging_table_name : str, client, log):
     
@@ -728,7 +712,6 @@ def drop_views(config: dict, redshift_conn: dict, client, log):
     
     ddl = f"""DROP VIEW IF EXISTS {schema_name}.{view_name}"""
 
-    
     try:
         resp = client.execute_statement(
             WorkgroupName=redshift_conn['workgroup_name'],
@@ -750,10 +733,10 @@ while True:
     except Exception as e:
         print(f"Failed to drop view '{view_name}' with error: {e}")
         raise
+
 #====================================================
 #check data type between df and redshift dataframe
 #====================================================
-
 def check_datatype_matching(redshift_df, df, log):
     # Build a lookup: column_name -> dataType
     log.info("checking for datatype mismatch between source file and redshift table")
@@ -785,7 +768,6 @@ def check_datatype_matching(redshift_df, df, log):
 # ===============================================================
 # AUDIT TABLE UPDATE
 # ===============================================================
-
 def update_job_sts_table(config: dict, redshift_conn: dict,
                          run_start_ts: str, run_end_ts: str,
                          source_filename: str,
@@ -815,7 +797,6 @@ def update_job_sts_table(config: dict, redshift_conn: dict,
 # ===============================================================
 # S3 HELPERS (archive & cleanup)
 # ===============================================================
-
 def move_s3_file_to_archive(config: dict, target_file_path: str, log):
     s3_client = boto3.client('s3')
     source_file_path = f"s3://{config['src_bucket']}/data/in/{config['source_file_name']}"
@@ -844,6 +825,7 @@ def delete_staging_s3_files(s3_staging_path: str, log):
             log.info(f"Deleted staging file: {obj['Key']}")
     except Exception as e:
         log.error("Error deleting staging files", error=str(e))
+
 
 def move_s3_file_to_unprocessed(config: dict, target_file_path: str, log):
     s3_client = boto3.client('s3')
@@ -908,7 +890,6 @@ def main():
     staging = _clean_colname(config['source_file_name'].split('.')[0])
     s3_staging_path = f"s3://{config['src_bucket']}/data/staging/{config['target_table']}_{staging}/{run_id}"
 
-
     try:
         df = read_csv_file(config, spark)
 
@@ -933,7 +914,6 @@ def main():
                 #Alter redshift table(Add new columns) if new columns are added in the source file
                 alter_redshift_table(config, redshift_conn, df, redshift_df, client, log, spark)
 
-        
         else:
             log.info("Target table does not exist; creating")
 
@@ -1002,7 +982,6 @@ def main():
             except Exception:
                 pass
         raise
-
 
 if __name__ == '__main__':
     main()
