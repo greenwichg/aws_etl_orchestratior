@@ -18,7 +18,10 @@ from pyspark.sql.functions import col, length, max as max_, lit, regexp_replace,
 from pyspark.sql.types import (
     StructType, StructField, StringType,
     IntegerType, FloatType, DoubleType, LongType, DecimalType,
-    BooleanType, TimestampType, DateType, BinaryType
+    BooleanType, TimestampType, DateType, BinaryType,
+    LongType, DecimalType, BooleanType, DataType,
+    TimestampType, BinaryType, ArrayType,
+    MapType
 )
 
 # ===============================================================
