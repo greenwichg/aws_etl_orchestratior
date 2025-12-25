@@ -1,10 +1,4 @@
-import sys
-import json
-import re
-import time
-import uuid
-import traceback
-import functools
+import sys, json, re, time, uuid, traceback, functools
 from datetime import datetime, timezone
 from textwrap import dedent
 
