@@ -35,7 +35,6 @@ class LogBuffer:
             payload.update(kv)
         self.lines.append(json.dumps(payload, ensure_ascii=False))
         print(json.dumps(payload))  # also emit to CloudWatch
-        
     
     def warning(self, msg: str, **kv):
         payload = {"level": "WARNING", "ts": self._ts(), "run_id": self.run_id, "msg": msg}
@@ -43,7 +42,6 @@ class LogBuffer:
             payload.update(kv)
         self.lines.append(json.dumps(payload, ensure_ascii=False))
         print(json.dumps(payload))
-
 
     def error(self, msg: str, **kv):
         payload = {"level": "ERROR", "ts": self._ts(), "run_id": self.run_id, "msg": msg}
