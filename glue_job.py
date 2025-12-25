@@ -361,7 +361,6 @@ def alter_varchar_columns(config: dict, redshift_conn: dict, df, client, log):
         "int8": 9223372036854775807,
     }
 
-
     string_cols = []
     int_cols = []
     
