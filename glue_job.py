@@ -480,6 +480,7 @@ if int_altered_cols:
     if desc['Status'] == 'FINISHED':
         log.info("view is refreshed successfully")
     
+
 # Fill missing columns to match target layout ----------------------------------
 
 def get_default_value(dtype):
@@ -500,11 +501,16 @@ def get_default_value(dtype):
 
 def fill_missing_columns(df, redshift_df):
     src_cols = set(df.columns)
+    missed_cols = []
     for colf in redshift_df.schema.fields:
         if colf.name not in src_cols:
+            missed_cols.append(colf.name)
             default_value = get_default_value(colf.dataType)
             df = df.withColumn(colf.name, lit(default_value))
-    return df.select(*redshift_df.columns)
+    if missed_cols:
+        log.info(f"columns: {missed_cols} filled with null values")
+        
+    return df
 
 # ===============================================================
 # STAGING TABLE + COPY
