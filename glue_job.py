@@ -750,6 +750,29 @@ while True:
     except Exception as e:
         print(f"Failed to drop view '{view_name}' with error: {e}")
         raise
+#====================================================
+#check data type between df and redshift dataframe
+#====================================================
+
+def check_datatype_matching(redshift_df, df, log):
+    # Build a lookup: column_name -> dataType
+    log.info("checking for datatype mismatch between source file and redshift table")
+    redshift_cols = {field.name: field.dataType for field in redshift_df.schema.fields}
+    
+    non_numeric_types = (
+        StringType, BooleanType, BinaryType, DateType, TimestampType,
+        ArrayType, MapType, StructType
+    )
+    
+    numeric_types = (
+        ByteType, ShortType, IntegerType, LongType,
+        FloatType, DoubleType, DecimalType
+    )
+    
+    for field in df.schema.fields:
+        if field.name in redshift_cols:
+            src_type = type(field.dataType)
+            tgt_type = type(redshift_cols[field.name])
 # ===============================================================
 # AUDIT TABLE UPDATE
 # ===============================================================
