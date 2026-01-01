@@ -1,4 +1,4 @@
-nyl-invgai-dev-anaplan (S3 bucket) <br>
+ingestion (S3 bucket) <br>
 ├── config/ <br>
 ├── data/ <br>
 │&nbsp;&nbsp;&nbsp;&nbsp;├── archive/ <br>
@@ -15,5 +15,5 @@ nyl-invgai-dev-anaplan (S3 bucket) <br>
 │&nbsp;&nbsp;&nbsp;&nbsp;└── 2025/ <br>
 │&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── 12/ <br>
 │&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── 15/ <br>
-├── nyl-invgai-glue-pipeline/ <br>
+├── ingestion-pipeline/ <br>
 └── scripts/
