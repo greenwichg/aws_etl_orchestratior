@@ -1,0 +1,5 @@
+fund_code,share_class,fund_name,fund_family,mgmt_fee_rate,asset_class,fund_status,advisor_code,advisor_name,team,region,advisor_status,report_date,version_code,fee_paying_aum,reportable_aum,revenue,transaction_id
+FND001,A,Growth Equity Fund,Equity Funds,0.0075,Equity,Active,ADV123,John Smith,East Coast,Northeast,Active,2025-01-15,ACTUAL,10000000,10500000,75000,TXN001
+FND001,A,Growth Equity Fund,Equity Funds,0.0075,Equity,Active,ADV124,Jane Doe,West Coast,Pacific,Active,2025-01-15,ACTUAL,5000000,5200000,37500,TXN002
+FND002,I,Bond Income Fund,Fixed Income Funds,0.0050,Fixed Income,Active,ADV125,Bob Johnson,Midwest,Central,Active,2025-01-15,ACTUAL,20000000,20000000,100000,TXN003
+FND003,C,International Fund,International Funds,0.0085,Equity,Active,ADV123,John Smith,East Coast,Northeast,Active,2025-01-15,ACTUAL,8000000,8500000,68000,TXN004

@@ -1,0 +1,5 @@
+cost_center_l4,cost_center_l4_name,cost_center_l3,cost_center_l3_name,cost_center_l2,cost_center_l2_name,cost_center_l1,cost_center_l1_name,department,report_date,version_code,expense_amount,expense_id,expense_category
+CC-1001,Portfolio Management Team,CC-100,Investment Operations,CC-10,Investment Division,CC-1,Corporate,Portfolio Management,2025-01-15,ACTUAL,250000,EXP001,Salary
+CC-1002,Research & Analytics,CC-100,Investment Operations,CC-10,Investment Division,CC-1,Corporate,Research,2025-01-15,ACTUAL,180000,EXP002,Salary
+CC-2001,Marketing Team,CC-200,Sales & Marketing,CC-20,Revenue Division,CC-2,Corporate,Marketing,2025-01-15,ACTUAL,120000,EXP003,Marketing
+CC-3001,IT Infrastructure,CC-300,Technology,CC-30,Support Division,CC-3,Corporate,Technology,2025-01-15,ACTUAL,95000,EXP004,Technology

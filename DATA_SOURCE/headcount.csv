@@ -1,0 +1,6 @@
+cost_center_l4,cost_center_l4_name,cost_center_l3,cost_center_l2,department,report_date,version_code,headcount,fte_count,employee_type
+CC-1001,Portfolio Management Team,CC-100,CC-10,Portfolio Management,2025-01-15,ACTUAL,25,24.5,Full-Time
+CC-1002,Research & Analytics,CC-100,CC-10,Research,2025-01-15,ACTUAL,18,17.5,Full-Time
+CC-2001,Marketing Team,CC-200,CC-20,Marketing,2025-01-15,ACTUAL,12,11.0,Full-Time
+CC-3001,IT Infrastructure,CC-300,CC-30,Technology,2025-01-15,ACTUAL,15,14.5,Full-Time
+CC-1001,Portfolio Management Team,CC-100,CC-10,Portfolio Management,2025-01-15,ACTUAL,3,1.5,Part-Time

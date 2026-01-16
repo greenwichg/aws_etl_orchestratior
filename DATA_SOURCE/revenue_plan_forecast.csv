@@ -1,0 +1,5 @@
+fund_code,share_class,fund_name,fund_family,asset_class,report_date,version_code,planned_aum,planned_revenue,plan_id,scenario
+FND001,A,Growth Equity Fund,Equity Funds,Equity,2025-02-01,PLAN,11000000,82500,PLN2025Q1,Base Case
+FND001,A,Growth Equity Fund,Equity Funds,Equity,2025-02-01,FORECAST,10800000,81000,FCT2025Q1,Conservative
+FND002,I,Bond Income Fund,Fixed Income Funds,Fixed Income,2025-02-01,PLAN,21000000,105000,PLN2025Q1,Base Case
+FND003,C,International Fund,International Funds,Equity,2025-02-01,PLAN,8500000,72250,PLN2025Q1,Base Case

@@ -1,0 +1,5 @@
+account_type,account_type_name,account_category,report_date,version_code,invoice_amount,invoice_number,invoice_id
+GA,General Account,General Account,2025-01-15,ACTUAL,125000,INV-2025-001,INV001
+SA,Separate Account,Separate Account,2025-01-15,ACTUAL,85000,INV-2025-002,INV002
+GA,General Account,General Account,2025-01-15,ACTUAL,95000,INV-2025-003,INV003
+SA,Separate Account,Separate Account,2025-01-15,ACTUAL,110000,INV-2025-004,INV004
