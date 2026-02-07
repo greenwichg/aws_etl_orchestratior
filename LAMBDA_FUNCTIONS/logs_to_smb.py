@@ -10,7 +10,6 @@ def lambda_handler(event, context):
     Transfers log file to SFTP immediately
     """
 
-    S3_BUCKET = os.environ.get('S3_BUCKET')
     SECRET_NAME = os.environ.get('SFTP_SECRET_NAME', 'prod/sftp/log-transfer')
 
     s3_client = boto3.client('s3')
