@@ -814,17 +814,25 @@ def process_dimension_from_config(df, dim_config: dict, redshift_conn: dict,
         .option("quote", '"') \
         .csv(s3_staging_path)
     
-    # Create staging table
+    # Build explicit column list matching the CSV (no surrogate key)
+    surrogate_key_col = f"{dim_table.replace('dim_', '')}_key"
+    scd_meta_cols = ["effective_date", "end_date", "is_current", "version", "created_date", "updated_date"]
+    staging_columns = dim_columns + scd_meta_cols
+
+    # Create staging table with only CSV columns (excludes surrogate key)
     create_stg_sql = f"""
         DROP TABLE IF EXISTS {schema}.{staging_dim};
-        CREATE TABLE {schema}.{staging_dim} (LIKE {schema}.{dim_table} INCLUDING DEFAULTS);
+        CREATE TABLE {schema}.{staging_dim} AS
+        SELECT {', '.join(staging_columns)}
+        FROM {schema}.{dim_table} WHERE 1=0;
     """
     execute_sql(create_stg_sql, redshift_conn, client)
-    
-    # COPY to staging
+
+    # COPY to staging — resolve single CSV file within the prefix
+    s3_single_file = _find_single_csv_in_prefix(s3_staging_path)
     copy_sql = f"""
         COPY {schema}.{staging_dim}
-        FROM '{s3_staging_path}'
+        FROM '{s3_single_file}'
         IAM_ROLE '{redshift_conn['iam_role']}'
         FORMAT AS CSV
         DELIMITER ','
@@ -832,10 +840,7 @@ def process_dimension_from_config(df, dim_config: dict, redshift_conn: dict,
         IGNOREHEADER 1;
     """
     execute_sql(copy_sql, redshift_conn, client)
-    
-    # Get surrogate key info
-    surrogate_key_col = f"{dim_table.replace('dim_', '')}_key"
-    
+
     # SCD Type 2 merge
     natural_key_join = " AND ".join([f"curr.{k} = stg.{k}" for k in natural_keys])
     
@@ -847,14 +852,17 @@ def process_dimension_from_config(df, dim_config: dict, redshift_conn: dict,
     else:
         scd_change_condition = "1=0"  # No SCD tracking
     
+    # Build explicit column list for INSERT (matches staging columns)
+    stg_col_refs = ', '.join([f"stg.{c}" for c in dim_columns])
+
     merge_sql = f"""
         BEGIN TRANSACTION;
-        
-        -- Get max surrogate key
+
+        -- Snapshot max surrogate key before any inserts
         CREATE TEMP TABLE max_key AS
-        SELECT COALESCE(MAX({surrogate_key_col}), 0) as max_key 
+        SELECT COALESCE(MAX({surrogate_key_col}), 0) as max_key
         FROM {schema}.{dim_table};
-        
+
         -- Expire changed records
         UPDATE {schema}.{dim_table} curr
         SET end_date = CURRENT_DATE - 1,
@@ -864,49 +872,56 @@ def process_dimension_from_config(df, dim_config: dict, redshift_conn: dict,
         WHERE {natural_key_join}
           AND curr.is_current = TRUE
           AND ({scd_change_condition});
-        
-        -- Insert new versions (for changed records)
+
+        -- Insert new versions for changed records (version = old version + 1)
         INSERT INTO {schema}.{dim_table}
-        SELECT 
-            ROW_NUMBER() OVER (ORDER BY {', '.join(natural_keys)}) + 
+            ({surrogate_key_col}, {', '.join(dim_columns)},
+             effective_date, end_date, is_current, version, created_date, updated_date)
+        SELECT
+            ROW_NUMBER() OVER (ORDER BY {', '.join(['stg.' + k for k in natural_keys])}) +
                 (SELECT max_key FROM max_key) as {surrogate_key_col},
-            stg.{', stg.'.join(dim_columns)},
+            {stg_col_refs},
             stg.effective_date,
             stg.end_date,
             stg.is_current,
-            stg.version,
+            expired.version + 1,
             stg.created_date,
             stg.updated_date
         FROM {schema}.{staging_dim} stg
-        WHERE EXISTS (
-            SELECT 1 FROM {schema}.{dim_table} curr
-            WHERE {natural_key_join}
-              AND curr.is_current = FALSE
-              AND curr.end_date = CURRENT_DATE - 1
-        );
-        
-        -- Insert completely new records
+        JOIN {schema}.{dim_table} expired
+            ON {' AND '.join([f'expired.{k} = stg.{k}' for k in natural_keys])}
+            AND expired.is_current = FALSE
+            AND expired.end_date = CURRENT_DATE - 1;
+
+        -- Refresh max key after first insert
+        DROP TABLE max_key;
+        CREATE TEMP TABLE max_key AS
+        SELECT COALESCE(MAX({surrogate_key_col}), 0) as max_key
+        FROM {schema}.{dim_table};
+
+        -- Insert completely new records (version = 1)
         INSERT INTO {schema}.{dim_table}
-        SELECT 
-            ROW_NUMBER() OVER (ORDER BY {', '.join(natural_keys)}) + 
-                (SELECT COALESCE(MAX({surrogate_key_col}), 0) FROM {schema}.{dim_table}) 
-                as {surrogate_key_col},
-            stg.{', stg.'.join(dim_columns)},
+            ({surrogate_key_col}, {', '.join(dim_columns)},
+             effective_date, end_date, is_current, version, created_date, updated_date)
+        SELECT
+            ROW_NUMBER() OVER (ORDER BY {', '.join(['stg.' + k for k in natural_keys])}) +
+                (SELECT max_key FROM max_key) as {surrogate_key_col},
+            {stg_col_refs},
             stg.effective_date,
             stg.end_date,
             stg.is_current,
-            stg.version,
+            1,
             stg.created_date,
             stg.updated_date
         FROM {schema}.{staging_dim} stg
         WHERE NOT EXISTS (
             SELECT 1 FROM {schema}.{dim_table} curr
-            WHERE {natural_key_join}
+            WHERE {' AND '.join([f'curr.{k} = stg.{k}' for k in natural_keys])}
         );
-        
+
         DROP TABLE {schema}.{staging_dim};
         DROP TABLE max_key;
-        
+
         COMMIT;
     """
     
@@ -953,17 +968,24 @@ def process_scd_type1_dimension(df, dim_config: dict, redshift_conn: dict,
         .option("quote", '"') \
         .csv(s3_staging_path)
     
-    # Create staging table
+    # Build explicit column list matching the CSV (no surrogate key)
+    surrogate_key_col = f"{dim_table.replace('dim_', '')}_key"
+    staging_columns = dim_columns + ["created_date"]
+
+    # Create staging table with only CSV columns (excludes surrogate key)
     create_stg_sql = f"""
         DROP TABLE IF EXISTS {schema}.{staging_dim};
-        CREATE TABLE {schema}.{staging_dim} (LIKE {schema}.{dim_table} INCLUDING DEFAULTS);
+        CREATE TABLE {schema}.{staging_dim} AS
+        SELECT {', '.join(staging_columns)}
+        FROM {schema}.{dim_table} WHERE 1=0;
     """
     execute_sql(create_stg_sql, redshift_conn, client)
-    
-    # COPY to staging
+
+    # COPY to staging — resolve single CSV file within the prefix
+    s3_single_file = _find_single_csv_in_prefix(s3_staging_path)
     copy_sql = f"""
         COPY {schema}.{staging_dim}
-        FROM '{s3_staging_path}'
+        FROM '{s3_single_file}'
         IAM_ROLE '{redshift_conn['iam_role']}'
         FORMAT AS CSV
         DELIMITER ','
@@ -971,40 +993,43 @@ def process_scd_type1_dimension(df, dim_config: dict, redshift_conn: dict,
         IGNOREHEADER 1;
     """
     execute_sql(copy_sql, redshift_conn, client)
-    
-    surrogate_key_col = f"{dim_table.replace('dim_', '')}_key"
     natural_key_join = " AND ".join([f"tgt.{k} = src.{k}" for k in natural_keys])
     
     # Build update columns (exclude natural keys and surrogate key)
     update_cols = [col for col in dim_columns if col not in natural_keys]
     update_clause = ', '.join([f"{col} = src.{col}" for col in update_cols])
     
+    # Build explicit column references for INSERT
+    src_col_refs = ', '.join([f"src.{c}" for c in dim_columns])
+
     # SCD Type 1 MERGE (update existing, insert new)
     merge_sql = f"""
         BEGIN TRANSACTION;
-        
+
         -- Update existing records (overwrite)
         UPDATE {schema}.{dim_table} tgt
         SET {update_clause},
             updated_date = GETDATE()
         FROM {schema}.{staging_dim} src
         WHERE {natural_key_join};
-        
-        -- Insert new records
+
+        -- Insert new records with explicit column list
         INSERT INTO {schema}.{dim_table}
-        SELECT 
-            ROW_NUMBER() OVER (ORDER BY {', '.join(natural_keys)}) + 
-                COALESCE((SELECT MAX({surrogate_key_col}) FROM {schema}.{dim_table}), 0) 
+            ({surrogate_key_col}, {', '.join(dim_columns)}, created_date)
+        SELECT
+            ROW_NUMBER() OVER (ORDER BY {', '.join(['src.' + k for k in natural_keys])}) +
+                COALESCE((SELECT MAX({surrogate_key_col}) FROM {schema}.{dim_table}), 0)
                 as {surrogate_key_col},
-            src.*
+            {src_col_refs},
+            src.created_date
         FROM {schema}.{staging_dim} src
         WHERE NOT EXISTS (
             SELECT 1 FROM {schema}.{dim_table} tgt
             WHERE {natural_key_join}
         );
-        
+
         DROP TABLE {schema}.{staging_dim};
-        
+
         COMMIT;
     """
     
@@ -1074,17 +1099,21 @@ def process_fact_from_config(df, fact_config: dict, redshift_conn: dict,
         .option("header", True) \
         .csv(s3_staging_path)
     
-    # Create staging fact table
+    # Create staging fact table with only CSV columns (excludes surrogate keys added via JOINs)
+    stg_col_list = [c for c in select_cols if c != "load_timestamp"] + ["load_timestamp"]
     create_stg_sql = f"""
         DROP TABLE IF EXISTS {schema}.{staging_fact};
-        CREATE TABLE {schema}.{staging_fact} (LIKE {schema}.{fact_table} INCLUDING DEFAULTS);
+        CREATE TABLE {schema}.{staging_fact} (
+            {', '.join(f'{c} VARCHAR(512)' for c in stg_col_list)}
+        );
     """
     execute_sql(create_stg_sql, redshift_conn, client)
     
-    # COPY to staging
+    # COPY to staging — resolve single CSV file within the prefix
+    s3_single_file = _find_single_csv_in_prefix(s3_staging_path)
     copy_sql = f"""
         COPY {schema}.{staging_fact}
-        FROM '{s3_staging_path}'
+        FROM '{s3_single_file}'
         IAM_ROLE '{redshift_conn['iam_role']}'
         FORMAT AS CSV
         DELIMITER ','
@@ -1127,12 +1156,16 @@ def process_fact_from_config(df, fact_config: dict, redshift_conn: dict,
                   [f"stg.{d}" for d in degen_dims] + ["stg.load_timestamp"]
     
     insert_sql = f"""
+        BEGIN TRANSACTION;
+
         INSERT INTO {schema}.{fact_table}
         SELECT {', '.join(all_columns)}
         FROM {schema}.{staging_fact} stg
         {' '.join(join_clauses)};
-        
+
         DROP TABLE {schema}.{staging_fact};
+
+        COMMIT;
     """
     
     execute_sql(insert_sql, redshift_conn, client)
@@ -1234,50 +1267,63 @@ def main():
 
         # ============================================================
         # DIMENSIONAL MODEL PROCESSING (CONFIG-DRIVEN)
+        # Wrapped in try/except so base ETL success is preserved
+        # even if star-schema population fails.
         # ============================================================
-        
-        # Load dimensional mappings from S3
-        dim_config = load_dimensional_config(config['src_bucket'])
-        
-        # Check if current table has dimensional model config
-        if config['target_table'] in dim_config:
-            log.info(f"Dimensional model found for {config['target_table']}")
-            
-            model_config = dim_config[config['target_table']]
-            
-            # Process dimensions first (SCD Type 1 or Type 2)
-            for dim in model_config.get('dimensions', []):
-                if dim.get('scd_type') == 1:
-                    process_scd_type1_dimension(
+        dim_staging_paths = []  # track S3 paths for cleanup
+        try:
+            dim_config = load_dimensional_config(config['src_bucket'])
+
+            if config['target_table'] in dim_config:
+                log.info(f"Dimensional model found for {config['target_table']}")
+
+                model_config = dim_config[config['target_table']]
+
+                # Process dimensions first (SCD Type 1 or Type 2)
+                for dim in model_config.get('dimensions', []):
+                    if dim.get('scd_type') == 1:
+                        process_scd_type1_dimension(
+                            df=df,
+                            dim_config=dim,
+                            redshift_conn=redshift_conn,
+                            spark=spark,
+                            client=client,
+                            log=log
+                        )
+                    else:  # Default to Type 2
+                        process_dimension_from_config(
+                            df=df,
+                            dim_config=dim,
+                            redshift_conn=redshift_conn,
+                            spark=spark,
+                            client=client,
+                            log=log
+                        )
+
+                # Then process facts (with surrogate key lookups)
+                for fact in model_config.get('facts', []):
+                    process_fact_from_config(
                         df=df,
-                        dim_config=dim,
+                        fact_config=fact,
                         redshift_conn=redshift_conn,
                         spark=spark,
                         client=client,
                         log=log
                     )
-                else:  # Default to Type 2
-                    process_dimension_from_config(
-                        df=df,
-                        dim_config=dim,
-                        redshift_conn=redshift_conn,
-                        spark=spark,
-                        client=client,
-                        log=log
-                    )
-            
-            # Then process facts (with surrogate key lookups)
-            for fact in model_config.get('facts', []):
-                process_fact_from_config(
-                    df=df,
-                    fact_config=fact,
-                    redshift_conn=redshift_conn,
-                    spark=spark,
-                    client=client,
-                    log=log
-                )
-            
-            log.info(f"Dimensional model processing completed for {config['target_table']}")
+
+                log.info(f"Dimensional model processing completed for {config['target_table']}")
+
+        except Exception as dim_err:
+            log.error("Dimensional model processing failed (base ETL succeeded)", error=str(dim_err))
+            traceback.print_exc()
+        finally:
+            # Cleanup dimension/fact staging files from S3
+            bucket = config['src_bucket']
+            for prefix in ["data/staging/dimensions/", "data/staging/facts/"]:
+                try:
+                    delete_staging_s3_files(f"s3://{bucket}/{prefix}", log)
+                except Exception:
+                    pass
 
         job.commit()
 
