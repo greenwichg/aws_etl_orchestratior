@@ -581,7 +581,7 @@ def _load_view_config(config: dict, log):
         log.error("source bucket is not defined")
         raise ValueError("source bucket not found")
 
-    key = "config/view_config.json"
+    key = "config/config_view.json"
     s3 = boto3.client('s3')
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
@@ -646,7 +646,7 @@ def create_views(config: dict, redshift_conn: dict, client, log):
 def drop_views(config: dict, redshift_conn: dict, client, log):
     v_config = _load_view_config(config, log)
     if not v_config:
-        log.info("No configuration found for the target table")
+        log.warning("No view configuration found for the target table — nothing to drop")
         return None
 
     view_name = v_config['view_name']
