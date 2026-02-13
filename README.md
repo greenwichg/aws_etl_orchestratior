@@ -69,7 +69,7 @@ aws_etl_orchestrator/
 |   |-- config_view.json            #   Redshift view definitions
 |   +-- dimensional_mappings.json   #   Star schema: dimensions + facts config
 |
-|-- glue_jobs/
+|-- glue_jobs/                       # AWS Glue ETL scripts (deployed to S3)
 |   |-- without_data_model/
 |   |   +-- glue_job.py             #   Core ETL: CSV -> Redshift (flat tables)
 |   +-- with_data_model/
@@ -78,9 +78,6 @@ aws_etl_orchestrator/
 |-- lambda_functions/
 |   |-- lambda_function.py          #   Orchestrator: SQS -> config match -> Step Functions
 |   +-- logs_to_smb.py              #   Log transfer: S3 -> SFTP
-|
-|-- state_machines/
-|   +-- state_machine.json          #   Step Functions workflow definition
 |
 |-- terraform/
 |   |-- main.tf                     #   Root module wiring all components
@@ -98,38 +95,43 @@ aws_etl_orchestrator/
 |       |-- sqs/                    #     FIFO queue + DLQ
 |       |-- lambda/                 #     Orchestrator + log transfer functions
 |       |-- iam/                    #     Roles and policies
-|       |-- glue/                   #     ETL job definition
+|       |-- glue/                   #     Two ETL job definitions (simple + data model)
 |       |-- step_functions/         #     State machine
+|       |-- redshift/               #     Redshift Serverless (namespace + workgroup)
 |       +-- sns/                    #     Notification topics
 |
-|-- event_bridge_rules/
-|   +-- event_bridge_rule.json      #   EventBridge pattern reference
+|-- stored_procedures/               #   Redshift stored procedures
+|   |-- 00_setup.sql                #     Audit tables setup
+|   |-- 01_utility_procedures.sql   #     Helper procedures
+|   |-- 02_merge_upsert.sql        #     Core merge/upsert
+|   |-- 03_scd_type2.sql           #     SCD Type 2 dimension processing
+|   |-- 04_scd_type1.sql           #     SCD Type 1 dimension processing
+|   |-- 05_fact_loader.sql         #     Fact table loader
+|   |-- 06_audit_logging.sql       #     Job status logging + views
+|   |-- 07_data_quality.sql        #     Data quality checks
+|   +-- 08_table_maintenance.sql   #     VACUUM, ANALYZE, maintenance
 |
-|-- data_source/                     #   Sample CSV source files
-|-- data_modeling/                   #   Star schema documentation
-|   +-- terminologies/              #     Data modeling concepts (SCD, grain, etc.)
+|-- scripts/                         # Operational scripts
+|   +-- bootstrap_terraform_backend.sh  # Terraform S3+DynamoDB backend setup
 |
-|-- warehouse_toolkits/              #   Utility libraries
-|   |-- data_quality_schema/        #     Data quality checks + schema evolution
-|   |-- historical_data/            #     Backfill utilities
-|   |-- incremental_loading/        #     CDC and incremental patterns
-|   +-- python_etl_essentials/      #     Python/PySpark reference material
+|-- data_source/                     # Sample CSV source files for testing
 |
-|-- stored_procedures/                #   Redshift stored procedures
-|   |-- 00_setup.sql                 #     Audit tables setup
-|   |-- 01_utility_procedures.sql    #     Helper procedures
-|   |-- 02_merge_upsert.sql         #     Core merge/upsert
-|   |-- 03_scd_type2.sql            #     SCD Type 2 dimension processing
-|   |-- 04_scd_type1.sql            #     SCD Type 1 dimension processing
-|   |-- 05_fact_loader.sql          #     Fact table loader
-|   |-- 06_audit_logging.sql        #     Job status logging + views
-|   |-- 07_data_quality.sql         #     Data quality checks
-|   +-- 08_table_maintenance.sql    #     VACUUM, ANALYZE, maintenance
+|-- warehouse_toolkits/              # Reusable utility libraries
+|   |-- data_quality_schema/        #   Data quality checks + schema evolution
+|   |-- historical_data/            #   Backfill utilities
+|   |-- incremental_loading/        #   CDC and incremental patterns
+|   +-- python_etl_essentials/      #   Python/PySpark reference material
 |
-|-- design_flow/                     #   Architecture workflow docs
-|-- enhancements/                    #   Future enhancement notes
-|-- investment_mgmts/                #   Domain documentation
-+-- s3_directory_structure/          #   S3 bucket layout reference
++-- docs/                            # Project documentation
+    |-- data_modeling/              #   Star schema docs + terminologies/
+    |-- scratch/                    #   Experimental/prototype scripts
+    |-- design_flow.md              #   Pipeline workflow steps
+    |-- enhancements.md             #   Future add-ons
+    |-- investment_mgmt.md          #   Domain documentation
+    |-- s3_directory_structure.md   #   S3 bucket layout reference
+    |-- event_bridge_rule.json      #   EventBridge pattern reference
+    |-- state_machine.json          #   Step Functions definition reference
+    +-- review_findings.md          #   Code review findings
 ```
 
 ---
@@ -148,6 +150,7 @@ Define ETL jobs that map source CSV files to Redshift tables:
         "source_file_name": "s3://ingestion/data/in/Products.csv",
         "target_table": "products",
         "upsert_keys": ["product_id", "time"],
+        "glue_job": "simple",
         "is_active": true
     }
 ]
@@ -160,6 +163,7 @@ Define ETL jobs that map source CSV files to Redshift tables:
 | `source_file_name` | S3 path to the expected source CSV |
 | `target_table` | Target Redshift table name |
 | `upsert_keys` | Columns used for MERGE (delete + insert) logic |
+| `glue_job` | `"simple"` for flat-table upsert, `"data_model"` for star schema ETL |
 | `is_active` | Set `false` to disable without removing |
 
 When a file arrives in S3 that doesn't match any config entry, Lambda moves it to `data/new_files/` and sends an SNS alert.
@@ -293,8 +297,9 @@ aws s3 sync configs/ "s3://${BUCKET}/config/"
 
 | Secret | Description |
 |--------|-------------|
-| `AWS_ROLE_ARN` | IAM role ARN for OIDC authentication (deploy/destroy) |
-| `AWS_ROLE_ARN_DEV` | IAM role ARN for CI plan operations |
+| `AWS_ACCESS_KEY_ID` | IAM access key for the deployer user |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret key for the deployer user |
+| `AWS_REGION` | Target AWS region (e.g., `us-east-1`) |
 
 ---
 
@@ -371,8 +376,9 @@ EventBridge -----> | SQS FIFO Queue    |-----> Lambda (concurrency=1)
 | `sqs` | FIFO queue, DLQ, queue policy | Buffered event delivery with failure handling |
 | `lambda` | 2 functions, event source mapping | Orchestrator + SFTP log transfer |
 | `iam` | 4 roles, policies | Least-privilege roles for each service |
-| `glue` | Job definition | PySpark ETL with configurable workers |
-| `step_functions` | State machine | Serial job orchestration |
+| `glue` | 2 job definitions (simple + data model) | Config-driven routing to flat-table or star-schema ETL |
+| `step_functions` | State machine | Serial job orchestration with dynamic Glue job selection |
+| `redshift` | Namespace, workgroup, Secrets Manager, IAM role | Redshift Serverless with auto-generated credentials |
 | `sns` | Topic, subscription | Email alerts for pipeline events |
 
 ---
@@ -387,6 +393,7 @@ EventBridge -----> | SQS FIFO Queue    |-----> Lambda (concurrency=1)
        "source_file_name": "s3://ingestion/data/in/NewFeed.csv",
        "target_table": "new_feed",
        "upsert_keys": ["id", "timestamp"],
+       "glue_job": "simple",
        "is_active": true
    }
    ```
