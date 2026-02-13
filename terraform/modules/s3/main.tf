@@ -14,8 +14,9 @@ locals {
 # S3 Bucket
 # ------------------------------------------------------------------------------
 resource "aws_s3_bucket" "etl_data" {
-  bucket = local.bucket_name
-  tags   = local.tags
+  bucket        = local.bucket_name
+  force_destroy = true
+  tags          = local.tags
 }
 
 # ------------------------------------------------------------------------------
