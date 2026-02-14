@@ -52,6 +52,11 @@ output "redshift_endpoint" {
   value       = module.redshift.endpoint_address
 }
 
+output "redshift_database" {
+  description = "Name of the Redshift database."
+  value       = module.redshift.database_name
+}
+
 output "redshift_secret_arn" {
   description = "ARN of the Secrets Manager secret with Redshift credentials."
   value       = module.redshift.secret_arn

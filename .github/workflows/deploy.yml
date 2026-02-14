@@ -77,6 +77,14 @@ jobs:
         working-directory: terraform/environments/${{ env.TF_ENV }}
         run: terraform apply -auto-approve tfplan
 
+      - name: Read Terraform outputs
+        id: tf-outputs
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        run: |
+          echo "workgroup=$(terraform output -raw redshift_workgroup_name)" >> "$GITHUB_OUTPUT"
+          echo "database=$(terraform output -raw redshift_database)" >> "$GITHUB_OUTPUT"
+          echo "secret_arn=$(terraform output -raw redshift_secret_arn)" >> "$GITHUB_OUTPUT"
+
       - name: Upload Glue scripts and configs to S3
         run: |
           BUCKET="etl-orchestrator-${TF_ENV}-data"
@@ -85,3 +93,59 @@ jobs:
           aws s3 cp glue_jobs/with_data_model/glue_job_with_data_model.py "s3://${BUCKET}/scripts/glue_job_with_data_model.py"
           echo "Syncing config files to s3://${BUCKET}/config/"
           aws s3 sync configs/ "s3://${BUCKET}/config/"
+
+      - name: Deploy stored procedures to Redshift
+        env:
+          RS_WORKGROUP: ${{ steps.tf-outputs.outputs.workgroup }}
+          RS_DATABASE: ${{ steps.tf-outputs.outputs.database }}
+          RS_SECRET_ARN: ${{ steps.tf-outputs.outputs.secret_arn }}
+        run: |
+          SQL_FILES=(
+            stored_procedures/00_setup.sql
+            stored_procedures/01_utility_procedures.sql
+            stored_procedures/02_merge_upsert.sql
+            stored_procedures/03_scd_type2.sql
+            stored_procedures/04_scd_type1.sql
+            stored_procedures/05_fact_loader.sql
+            stored_procedures/06_audit_logging.sql
+            stored_procedures/07_data_quality.sql
+            stored_procedures/08_table_maintenance.sql
+          )
+
+          for sql_file in "${SQL_FILES[@]}"; do
+            echo "Running ${sql_file}..."
+            SQL_CONTENT=$(cat "$sql_file")
+
+            STMT_ID=$(aws redshift-data execute-statement \
+              --workgroup-name "$RS_WORKGROUP" \
+              --database "$RS_DATABASE" \
+              --secret-arn "$RS_SECRET_ARN" \
+              --sql "$SQL_CONTENT" \
+              --query 'Id' --output text)
+
+            echo "  Statement ID: ${STMT_ID}"
+
+            # Poll until the statement finishes
+            while true; do
+              STATUS=$(aws redshift-data describe-statement \
+                --id "$STMT_ID" \
+                --query 'Status' --output text)
+              case "$STATUS" in
+                FINISHED)
+                  echo "  ${sql_file} completed successfully."
+                  break
+                  ;;
+                FAILED|ABORTED)
+                  ERROR=$(aws redshift-data describe-statement \
+                    --id "$STMT_ID" \
+                    --query 'Error' --output text)
+                  echo "  ERROR in ${sql_file}: ${ERROR}"
+                  exit 1
+                  ;;
+                *)
+                  sleep 2
+                  ;;
+              esac
+            done
+          done
+          echo "All stored procedures deployed successfully."
