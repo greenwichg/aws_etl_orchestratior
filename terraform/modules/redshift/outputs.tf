@@ -31,3 +31,8 @@ output "redshift_copy_role_arn" {
   description = "ARN of the IAM role for Redshift COPY from S3."
   value       = aws_iam_role.redshift_s3.arn
 }
+
+output "database_name" {
+  description = "Name of the Redshift database."
+  value       = var.database_name
+}
