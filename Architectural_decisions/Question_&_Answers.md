@@ -239,9 +239,9 @@ S3 supports 3,500 PUT/s per prefix — almost never the bottleneck for CSV file 
 ---
 
 ## Quick Reference: Service Selection Rationale
-
+ 
 | Decision | Service Chosen | Primary Reason | Key Alternative Rejected |
-
+|---|---|---|---|
 | Event buffering | SQS FIFO | Ordered, exactly-once delivery | Standard SQS (no ordering) |
 | Orchestration entry | Lambda (concurrency=1) | Config matching + serial control | EventBridge → Glue direct (no logic layer) |
 | Job wait | Step Functions .sync | 15-min Lambda timeout bypass | Lambda polling (hits timeout) |
@@ -249,3 +249,4 @@ S3 supports 3,500 PUT/s per prefix — almost never the bottleneck for CSV file 
 | Merge strategy | DELETE + INSERT | Dynamic composite keys + rollback point | Native MERGE (static ON clause) |
 | S3 event detection | EventBridge | Content-based filtering + fan-out | S3 native notifications (prefix/suffix only) |
 | Credential management | Secrets Manager | Long-running job stability + auto-rotation | IAM DB auth (15-min TTL breaks Glue) |
+ 
