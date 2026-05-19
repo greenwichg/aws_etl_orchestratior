@@ -140,6 +140,132 @@ CloudWatch permissions are embedded within each service role rather than a separ
 
 ---
 
+## IAM Policy JSON — Field Reference
+
+Every IAM policy document is built from the same set of fields. Understanding each one lets you read, write, and critique any policy on the spot.
+
+---
+
+### Top-Level Fields
+
+| Field | Required | What It Means |
+|-------|----------|--------------|
+| `Version` | Yes | The policy language version. Always use `"2012-10-17"` — the older `"2008-10-17"` version lacks support for policy variables like `${aws:username}`. |
+| `Statement` | Yes | An array of one or more individual permission rules. Each object in this array is evaluated independently. |
+
+---
+
+### Statement-Level Fields
+
+| Field | Required | What It Means |
+|-------|----------|--------------|
+| `Sid` | No | **Statement ID** — a human-readable label for the statement. Has no effect on evaluation; used for auditing, documentation, and referencing statements in error messages. Example: `"S3ReadConfig"`. |
+| `Effect` | Yes | Either `"Allow"` or `"Deny"`. AWS defaults to **implicit deny** — if no statement allows an action, it is denied. An explicit `"Deny"` overrides any `"Allow"`, even from another policy. |
+| `Principal` | Conditionally | **Who** this statement applies to. Required in trust policies and resource-based policies; omitted in identity-based policies (where the principal is whoever the policy is attached to). Can be a service (`"lambda.amazonaws.com"`), an AWS account, an IAM role/user ARN, or `"*"` (anyone). |
+| `Action` | Yes | **What** API operations are being allowed or denied. Format is `"service:OperationName"` (e.g. `"s3:GetObject"`). Can be a single string or an array. Wildcards are supported: `"s3:*"` means all S3 actions. |
+| `Resource` | Yes (in most policies) | **What** AWS resources the actions apply to. Specified as ARNs. Use `"*"` only when a specific ARN cannot be used (e.g. list operations). Wildcards within ARNs are supported: `"arn:aws:s3:::my-bucket/*"`. |
+| `Condition` | No | **When** the statement applies. Adds extra constraints using condition keys. Only takes effect if all conditions evaluate to true. See examples below. |
+
+---
+
+### Effect Values Explained
+
+```
+AWS Default: everything is IMPLICITLY DENIED unless a policy explicitly allows it.
+
+Allow  →  grants the action if no Deny overrides it
+Deny   →  always wins, overrides any Allow from any policy (explicit deny)
+```
+
+| Scenario | Result |
+|----------|--------|
+| No matching statement | Implicit deny — access blocked |
+| Statement with `Effect: Allow` matches | Access granted |
+| Statement with `Effect: Deny` matches | Access blocked, even if another policy allows it |
+| Both Allow and Deny match | Deny always wins |
+
+---
+
+### Principal Values Explained
+
+| Value | Meaning |
+|-------|---------|
+| `"Service": "lambda.amazonaws.com"` | AWS Lambda service can assume this role |
+| `"Service": "states.amazonaws.com"` | AWS Step Functions service can assume this role |
+| `"AWS": "arn:aws:iam::123456789012:root"` | An AWS account (all principals in that account) |
+| `"AWS": "arn:aws:iam::123456789012:role/my-role"` | A specific IAM role |
+| `"*"` | Anyone — use only when intentional (e.g. public S3 bucket) |
+
+---
+
+### Action Naming Pattern
+
+```
+"service-prefix:OperationName"
+
+Examples:
+  s3:GetObject           → S3 GetObject API
+  states:StartExecution  → Step Functions StartExecution API
+  redshift-data:ExecuteStatement → Redshift Data API ExecuteStatement
+  logs:PutLogEvents      → CloudWatch Logs PutLogEvents API
+```
+
+Wildcards:
+- `"s3:*"` — all S3 actions
+- `"s3:Get*"` — all S3 Get actions (GetObject, GetBucketPolicy, etc.)
+
+---
+
+### Condition Block Explained
+
+```json
+"Condition": {
+  "ConditionOperator": {
+    "ConditionKey": "ConditionValue"
+  }
+}
+```
+
+| Component | What It Is | Example |
+|-----------|-----------|---------|
+| **Condition operator** | How to compare key to value | `StringEquals`, `ArnLike`, `ArnEquals`, `IpAddress`, `Bool` |
+| **Condition key** | The attribute being tested | `aws:SourceArn`, `aws:SourceAccount`, `aws:RequestedRegion` |
+| **Condition value** | The expected value | A specific ARN, account ID, region string |
+
+Common patterns in this architecture:
+
+```json
+// Restrict EventBridge → SQS to a specific rule (prevents other rules writing to the queue)
+"Condition": {
+  "ArnEquals": { "aws:SourceArn": "arn:aws:events:...:rule/my-rule" }
+}
+
+// Restrict S3 → Lambda invocation to a specific bucket
+"Condition": {
+  "ArnLike": { "aws:SourceArn": "arn:aws:s3:::my-bucket" }
+}
+
+// Restrict CloudWatch PutMetricData to specific namespaces
+"Condition": {
+  "StringEquals": { "cloudwatch:namespace": ["AWS/Lambda", "Glue"] }
+}
+```
+
+> **ArnEquals vs ArnLike:** `ArnEquals` requires an exact match. `ArnLike` supports wildcards (`*`, `?`) within the ARN — useful when the full ARN isn't known at policy creation time (e.g. any object in a bucket).
+
+---
+
+### Two Types of IAM Policies
+
+| Type | Where It Lives | Who It Applies To | Used For |
+|------|---------------|------------------|---------|
+| **Identity-based policy** | Attached to a role/user/group | Whoever holds the role | Granting permissions to a service or user |
+| **Resource-based policy** | Attached to the resource itself | Anyone who calls the resource | Cross-account access, service-to-service (e.g. EventBridge → SQS, S3 → Lambda) |
+
+> In this architecture: Lambda roles, Glue role, Step Functions role, and Redshift role are **identity-based**. The EventBridge → SQS permission and S3 → Lambda invocation are **resource-based policies**.
+
+---
+
 ## IAM Policy JSON Definitions
 
 Full policy documents as they would appear in AWS — useful for direct deployment via AWS Console, CloudFormation, or boto3.
