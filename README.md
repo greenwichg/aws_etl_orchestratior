@@ -1,4 +1,4 @@
-# AWS ETL Orchestrator
+# AWS ETL Orchestrator:
 
 A production-ready, config-driven ETL pipeline that ingests CSV files from S3, transforms them with PySpark, and loads them into Amazon Redshift Serverless. Supports both flat table ingestion and star schema dimensional modeling with SCD Type 1 and Type 2 tracking.
 
