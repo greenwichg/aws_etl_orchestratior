@@ -425,15 +425,13 @@ dyf = dyf.resolveChoice(choice="cast:string")           # or make_struct to keep
 ## 8. Building the entire ELT on DynamicFrames
 
 A forward-looking **design**. The biggest shift is the load path; schema evolution
-against Redshift stays explicit (§6.3 limitation). A runnable reference implementation
-of this design lives at
-[`glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py`](../../glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py)
-— a **new, standalone** script; the two production scripts are untouched.
+against Redshift stays explicit (§6.3 limitation). This section is a blueprint — the
+code blocks below are illustrative, not a deployed job.
 
 ### 8.0 The two flows side by side
 
 ```
- CURRENT  (DataFrame — glue_job.py)            VARIANT  (DynamicFrame — glue_job_dynamicframe.py)
+ CURRENT  (DataFrame — glue_job.py)            VARIANT  (DynamicFrame design)
  ─────────────────────────────────            ────────────────────────────────────────────────
  spark.read.csv          (NO bookmarks)        create_dynamic_frame.from_options
    │  inferSchema · rename · cast                │  transformation_ctx ........... BOOKMARKS ON
@@ -533,12 +531,10 @@ This is the **only** configuration with hands-off, end-to-end schema evolution.
 
 ### 8.4 End-to-end skeleton
 
-This is the shape implemented in the runnable reference
-[`glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py`](../../glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py)
-(full parity with the simple `without_data_model` job). Note the ordering: **schema
-evolution runs via the Data API *before* the load**, because integer promotion reorders
-Redshift columns and `COPY` is positional — so the frame must be aligned to the
-post-evolution schema before the connector writes it.
+A simple-job (`without_data_model`) shape. Note the ordering: **schema evolution runs
+via the Data API *before* the load**, because integer promotion reorders Redshift columns
+and `COPY` is positional — so the frame must be aligned to the post-evolution schema
+before the connector writes it.
 
 ```python
 def main_dynamic():
