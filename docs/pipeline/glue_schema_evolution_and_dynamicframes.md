@@ -1,14 +1,12 @@
-# Glue Schema Evolution, DynamicFrames, Bookmarks & Job Best Practices
+# Glue Schema Evolution, DynamicFrames & Bookmarks
 
 This is the reference for **how the Glue ETL jobs handle schema**, **how every module
-would look if rebuilt on AWS Glue `DynamicFrame`s**, **how Glue job bookmarks work
-(and fail)**, and the broader **best practices** for developing Glue jobs in this
-orchestrator.
+would look if rebuilt on AWS Glue `DynamicFrame`s**, and **how Glue job bookmarks work
+(and fail)** in this orchestrator.
 
 It complements [`data_pipeline_logic.md`](./data_pipeline_logic.md) (the end-to-end
 pipeline walkthrough). Where that doc explains *the flow*, this one explains *schema
-handling, the DynamicFrame alternative module-by-module, bookmarks, and engineering
-practice*.
+handling, the DynamicFrame alternative module-by-module, and bookmarks*.
 
 **Source files referenced throughout:**
 
@@ -31,9 +29,8 @@ practice*.
 7. [Complete module reference (every function, today and on DynamicFrames)](#7-complete-module-reference-every-function-today-and-on-dynamicframes)
 8. [Building the entire ELT on DynamicFrames](#8-building-the-entire-elt-on-dynamicframes)
 9. [Glue job bookmarks: schema, keys, and failure modes](#9-glue-job-bookmarks-schema-keys-and-failure-modes)
-10. [Other important scenarios and best practices](#10-other-important-scenarios-and-best-practices)
-11. [Design considerations and trade-offs](#11-design-considerations-and-trade-offs)
-12. [Quick reference](#12-quick-reference)
+10. [Design considerations and trade-offs](#10-design-considerations-and-trade-offs)
+11. [Quick reference](#11-quick-reference)
 
 ---
 
@@ -161,7 +158,8 @@ column count stays aligned with the table.
   alter an integer column's type in place).
 
 > The single `.agg().collect()` returns **one** row of aggregates, not the dataset —
-> it does not pull data to the driver (contrast with `df.collect()`, see §10.10).
+> it does not pull data to the driver (contrast with `df.collect()` on a full dataset,
+> which can OOM the driver).
 
 ### 4.5 Aligning column order before COPY
 
@@ -215,7 +213,8 @@ dyf = glueContext.create_dynamic_frame.from_catalog(
     database="ingestion_db", table_name="aum_revenue_raw",
     transformation_ctx="dyf_aum")
 
-# (b) From S3/JDBC directly. format_options handles CSV edge cases (§10.4).
+# (b) From S3/JDBC directly. format_options handles CSV edge cases
+#     (quoteChar, escaper, multiline, withHeader, corrupt-record capture).
 dyf = glueContext.create_dynamic_frame.from_options(
     connection_type="s3",
     connection_options={"paths": ["s3://bucket/data/in/"], "recurse": True},
@@ -481,7 +480,7 @@ def load_and_merge(dyf, config, redshift_conn, client):
     pre = [f"CREATE TABLE IF NOT EXISTS {schema}.{table}_stg (LIKE {schema}.{table});",
            f"TRUNCATE TABLE {schema}.{table}_stg;"]
     for name, dt in src.items():                          # additive evolution → preactions
-        if name not in tgt and _valid_ident(name):        # §10.7 identifier hardening
+        if name not in tgt and _valid_ident(name):        # validate identifier before DDL interpolation
             rtype = _spark_to_redshift_type(dt)
             pre += [f"ALTER TABLE {schema}.{table} ADD COLUMN {name} {rtype};",
                     f"ALTER TABLE {schema}.{table}_stg ADD COLUMN {name} {rtype};"]
@@ -677,90 +676,7 @@ stable surrogate.
 
 ---
 
-## 10. Other important scenarios and best practices
-
-Grounded in what the jobs already do well, plus gaps worth closing.
-
-### 10.1 Idempotency & exactly-once (implemented)
-Delete-then-insert MERGE on upsert keys (`sp_merge_from_staging`,
-`stored_procedures/02_merge_upsert.sql`) + SQS FIFO + Lambda reserved concurrency 1 +
-Step Functions `MaxConcurrency: 1`. Re-running a file yields the same result. Keep
-upsert keys genuinely unique.
-
-### 10.2 Staging + COPY + MERGE (implemented)
-Never `INSERT` row-by-row into Redshift. Write once, `COPY` into staging, MERGE. `COPY`
-is massively parallel; the staging hop makes the upsert atomic.
-
-### 10.3 `coalesce(1)` before COPY (implemented — know the trade-off)
-Forces a single output file so `COPY` reads a consistent object. **Cost:** funnels the
-final write through one task — fine for report-sized files; for multi-GB outputs prefer
-multiple files (`COPY` parallelises) or a manifest.
-
-### 10.4 CSV read robustness (gap worth closing)
-`inferSchema=true` reads the file **twice**; pass an explicit schema (you already build
-one from Redshift) for large inputs. With the DynamicFrame reader, set `format_options`
-for real-world CSVs: `quoteChar`, `escaper`, `multiline`, `withHeader`, and a
-corrupt-record column to capture malformed rows instead of failing.
-
-### 10.5 Run-isolated staging paths (implemented)
-Staging S3 prefixes and staging tables are keyed by `run_id`/UUID, so concurrent or
-retried runs never clobber each other.
-
-### 10.6 Job bookmarks for incremental ingest
-See §9. Only relevant if you batch-read folders; the event-driven design already
-processes each file once.
-
-### 10.7 SQL string-building / injection hardening (gap — important)
-DDL/DML is assembled with f-strings from config and column names (e.g.
-`ALTER TABLE … ADD COLUMN {col} {rtype}`). The audit writer escapes quotes, but
-identifiers are not validated. Since `target_table`/`upsert_keys`/column names flow from
-`config.json` and file headers, **validate identifiers** (`^[A-Za-z_][A-Za-z0-9_]*$`)
-before interpolation and prefer parameterised `Parameters=[…]` for **values**.
-
-### 10.8 Data quality gates (partially present)
-`stored_procedures/07_data_quality.sql` + the commented `check_datatype_matching` show
-intent. Add row-count drift, null-rate checks on keys, duplicate-key detection **before**
-MERGE, and ideally **Glue Data Quality** (DQDL) rulesets that fail the job and emit
-results.
-
-### 10.9 Structured logging & audit (implemented — strong)
-`LogBuffer` emits JSON to CloudWatch and exports to `s3://…/logs/YYYY/MM/DD/`, correlated
-by `run_id`; `job_sts` records counts/status. Keep `run_id` on every line and in the
-audit row.
-
-### 10.10 Spark hygiene
-Avoid `df.collect()`/`toPandas()` on full datasets (driver OOM). The single-row
-aggregate `collect()` in `alter_varchar_columns` is fine. Cache only on reuse. On larger
-inputs, watch small files/skew; tune `spark.sql.shuffle.partitions` and use
-`groupFiles`/`groupSize` (DynamicFrame readers) rather than always `coalesce(1)`.
-
-### 10.11 Resilience: retries & failure routing (implemented)
-`@retry_on_exception` (exp backoff) wraps Data API calls; on failure the source moves to
-`data/unprocessed/…`, audit is marked `FAILED`, logs flush, and the exception re-raises
-so Step Functions sees it. The data-model job wraps star-schema processing in try/except
-so **base ETL success is preserved** if dimensional load fails.
-
-### 10.12 Partitioning & pushdown (for catalog/large sources)
-For Data-Catalog sources, use `push_down_predicate` / `catalogPartitionPredicate` to
-prune partitions before read, and `partitionKeys` on write. Not needed for the current
-single-file CSVs but essential if inputs grow.
-
-### 10.13 Worker sizing, timeouts, cost
-Smallest worker that fits (`G.1X`/`G.2X`), enable **auto-scaling**, set a **job timeout**.
-These files are small → low `NumberOfWorkers`. See `docs/operations/cost_estimation.md`.
-
-### 10.14 Secrets & connectivity (implemented)
-Credentials via **Secrets Manager** (`secret_arn`); the **Redshift Data API** (HTTP, no
-VPC/driver/pool). Moving to the DynamicFrame Redshift connector trades this simplicity
-for a JDBC Glue Connection + VPC route (§8.5).
-
-### 10.15 Glue version
-Target **Glue 5.0** (Spark 3.5.4 / Python 3.11) for the performance/cost wins and
-`requirements.txt` support in `glue_features.md`, unless a library pins you older.
-
----
-
-## 11. Design considerations and trade-offs
+## 10. Design considerations and trade-offs
 
 | Decision in this repo | Benefit | Trade-off / when to revisit |
 |-----------------------|---------|------------------------------|
@@ -776,7 +692,7 @@ Target **Glue 5.0** (Spark 3.5.4 / Python 3.11) for the performance/cost wins an
 
 ---
 
-## 12. Quick reference
+## 11. Quick reference
 
 ### Complete module inventory (both jobs)
 
