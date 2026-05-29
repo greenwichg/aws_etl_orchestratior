@@ -256,7 +256,7 @@ Each environment has:
 - AWS account with appropriate permissions
 - Terraform >= 1.7.0
 - AWS CLI configured
-- GitHub repository with OIDC configured for AWS
+- GitHub repository with AWS credentials configured — see [docs/setup/configuring_aws_credentials.md](docs/setup/configuring_aws_credentials.md) (access keys today; OIDC also supported)
 
 ### Manual Deployment
 
