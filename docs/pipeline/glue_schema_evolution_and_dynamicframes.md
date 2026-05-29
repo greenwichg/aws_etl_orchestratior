@@ -424,8 +424,37 @@ dyf = dyf.resolveChoice(choice="cast:string")           # or make_struct to keep
 
 ## 8. Building the entire ELT on DynamicFrames
 
-A forward-looking **design** (not the current code). The biggest shift is the load
-path; schema evolution against Redshift stays explicit (§6.3 limitation).
+A forward-looking **design**. The biggest shift is the load path; schema evolution
+against Redshift stays explicit (§6.3 limitation). A runnable reference implementation
+of this design lives at
+[`glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py`](../../glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py)
+— a **new, standalone** script; the two production scripts are untouched.
+
+### 8.0 The two flows side by side
+
+```
+ CURRENT  (DataFrame — glue_job.py)            VARIANT  (DynamicFrame — glue_job_dynamicframe.py)
+ ─────────────────────────────────            ────────────────────────────────────────────────
+ spark.read.csv          (NO bookmarks)        create_dynamic_frame.from_options
+   │  inferSchema · rename · cast                │  transformation_ctx ........... BOOKMARKS ON
+   ▼                                             ▼  resolveChoice ................ choice types
+ read_redshift_table_schema  ◄── Data API      apply_mapping / cast ............ rename+cast+reorder
+   │  reconcile: ALTER · backfill · widen        │
+   ▼                                             ▼  errorsAsDynamicFrame ......... quarantine bad rows
+ df.select(target order)                       reconcile drift → preactions (ALTER/CREATE/backfill)
+   │                                             │
+   ▼  coalesce(1).write.csv ──► S3 staging       ▼  write_dynamic_frame(connection_type="redshift")
+ create_staging_table    ◄── Data API             ├─ preactions  : CREATE/ALTER staging + target
+   ▼  copy_to_redshift (COPY) ◄── Data API         ├─ (connector writes tmpDir + runs COPY)
+   ▼  run_merge (DELETE+INSERT) ◄── Data API       └─ postactions : CALL sp_merge_from_staging
+   ▼                                             ▼
+ job.commit()        (no-op for bookmarks)      job.commit() .................... BOOKMARK advances
+```
+
+> Left is the current, target-anchored DataFrame pipeline. Right replaces the read +
+> five load functions with a bookmarked DynamicFrame read and **one** connector write
+> carrying `preactions`/`postactions`; the schema-reconciliation logic survives as the
+> `preactions` (§6.3 — Redshift DDL is never auto-evolved).
 
 ### 8.1 Type conform — `apply_mapping` + `resolveChoice`
 
