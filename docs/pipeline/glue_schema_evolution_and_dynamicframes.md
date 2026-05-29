@@ -1,13 +1,14 @@
-# Glue Schema Evolution, DynamicFrames & Job Best Practices
+# Glue Schema Evolution, DynamicFrames, Bookmarks & Job Best Practices
 
-This document explains how schema evolution is handled in the Glue ETL jobs of this
-orchestrator, how AWS Glue `DynamicFrame`s are created and managed (and how they
-relate to the `DataFrame`-based approach this repo actually uses), and the broader
-set of scenarios and best practices to keep in mind when developing Glue jobs.
+This is the reference for **how the Glue ETL jobs handle schema**, **how every module
+would look if rebuilt on AWS Glue `DynamicFrame`s**, **how Glue job bookmarks work
+(and fail)**, and the broader **best practices** for developing Glue jobs in this
+orchestrator.
 
-It complements [`data_pipeline_logic.md`](./data_pipeline_logic.md), which walks the
-end-to-end pipeline. Here the focus is **schema handling** and **Glue engineering
-practice**.
+It complements [`data_pipeline_logic.md`](./data_pipeline_logic.md) (the end-to-end
+pipeline walkthrough). Where that doc explains *the flow*, this one explains *schema
+handling, the DynamicFrame alternative module-by-module, bookmarks, and engineering
+practice*.
 
 **Source files referenced throughout:**
 
@@ -15,75 +16,75 @@ practice**.
 |-----|------|
 | Simple (flat-table) ETL | `glue_jobs/without_data_model/glue_job.py` |
 | Data-model (star schema) ETL | `glue_jobs/with_data_model/glue_job_with_data_model.py` |
-| Prototypes / reference | `docs/scratch/*.py`, `glue_features/glue_features.md`, `scenario_based_questions/scenario_based_questions.md` |
+| Reference / prototypes | `docs/scratch/*.py`, `glue_features/glue_features.md`, `scenario_based_questions/scenario_based_questions.md` |
 
 ---
 
 ## Table of Contents
 
-1. [TL;DR — the most important thing to know](#1-tldr)
+1. [TL;DR](#1-tldr)
 2. [Two paradigms: DataFrame vs DynamicFrame](#2-two-paradigms-dataframe-vs-dynamicframe)
-3. [The approach used in this repository](#3-the-approach-used-in-this-repository)
+3. [The current architecture (DataFrame flow)](#3-the-current-architecture-dataframe-flow)
 4. [Schema evolution strategies (as implemented)](#4-schema-evolution-strategies-as-implemented)
-5. [AWS Glue DynamicFrames — creation & management](#5-aws-glue-dynamicframes--creation--management)
-6. [Schema evolution *with* DynamicFrames](#6-schema-evolution-with-dynamicframes)
-7. [Building the entire ELT on DynamicFrames (module-by-module)](#7-building-the-entire-elt-on-dynamicframes-module-by-module)
-8. [Other important scenarios & best practices](#8-other-important-scenarios--best-practices)
-9. [Design considerations & trade-offs](#9-design-considerations--trade-offs)
-10. [Quick reference](#10-quick-reference)
+5. [DynamicFrames: creation and management](#5-dynamicframes-creation-and-management)
+6. [Schema evolution with DynamicFrames](#6-schema-evolution-with-dynamicframes)
+7. [Complete module reference (every function, today and on DynamicFrames)](#7-complete-module-reference-every-function-today-and-on-dynamicframes)
+8. [Building the entire ELT on DynamicFrames](#8-building-the-entire-elt-on-dynamicframes)
+9. [Glue job bookmarks: schema, keys, and failure modes](#9-glue-job-bookmarks-schema-keys-and-failure-modes)
+10. [Other important scenarios and best practices](#10-other-important-scenarios-and-best-practices)
+11. [Design considerations and trade-offs](#11-design-considerations-and-trade-offs)
+12. [Quick reference](#12-quick-reference)
 
 ---
 
 ## 1. TL;DR
 
-- **This repo does schema evolution with native Spark `DataFrame`s**, not Glue
+- **The production jobs do schema evolution with native Spark `DataFrame`s**, not Glue
   `DynamicFrame`s. The job reads the CSV with Spark, reads the **target Redshift
-  table's schema** via the Redshift Data API, and **reconciles the two** —
-  adding/altering Redshift columns and back-filling source columns as needed.
-- The Redshift table is treated as the **schema authority**. Evolution is
-  **additive and target-anchored**: new columns are added, missing columns are
-  back-filled, and `VARCHAR`/integer columns are widened. Nothing is dropped or
-  narrowed automatically.
-- **`DynamicFrame`s are a Glue-specific abstraction** that defer type resolution
-  (the "choice" type) and are excellent for *messy, self-describing, semi-structured*
-  sources. They are **not used in the production jobs here** — but you should
-  understand them because they are the idiomatic Glue answer to schema drift and
-  appear in this repo's reference material.
-- Sections 5–7 answer the "how are DynamicFrames created and managed" question in
-  full and show how you would slot one into this pipeline.
+  table's schema** via the Redshift Data API, and **reconciles** the two — adding/
+  altering Redshift columns and back-filling source columns as needed.
+- The **Redshift table is the schema authority**. Evolution is **additive and
+  target-anchored**: new columns are added, missing columns back-filled, `VARCHAR`/
+  integer columns widened. Nothing is dropped or narrowed automatically.
+- **`DynamicFrame`s** defer type resolution (the `choice` type), capture bad records,
+  integrate with the Glue Catalog/bookmarks, and (via the Redshift connector) collapse
+  the whole `coalesce → COPY → stage → merge` plumbing into one call. They are **not
+  used here**, but §5–§8 show exactly how each module would change if they were.
+- **Job bookmarks are effectively inert in the current jobs**: both read via
+  `spark.read.csv`, which does **not** participate in bookmarks, so `job.commit()`
+  advances no source state. Incrementality today comes from **event-driven single-file
+  triggering + archiving**, not bookmarks (see §9).
+- §7 is a **complete module inventory** of both jobs; §9 is a deep dive on bookmark
+  schema/keys and failure modes.
 
 ---
 
 ## 2. Two paradigms: DataFrame vs DynamicFrame
 
-AWS Glue gives you two in-memory abstractions. They interoperate freely
-(`dyf.toDF()` / `DynamicFrame.fromDF(df, glueContext, "name")`), so most real jobs
-mix them.
+AWS Glue gives you two in-memory abstractions that interoperate freely
+(`dyf.toDF()` / `DynamicFrame.fromDF(df, glueContext, "name")`).
 
 | Aspect | Spark `DataFrame` (used here) | Glue `DynamicFrame` |
 |--------|-------------------------------|----------------------|
-| Schema | **Fixed** — resolved at read time (`inferSchema` or explicit) | **Flexible / self-describing** — each record carries its own schema; ambiguity is preserved as a `choice` type |
-| Type conflicts | Fail at read, or coerce to one type | Captured as a `choice`, resolved later with `resolveChoice` |
-| Best for | Tabular, predictable, columnar (CSV/Parquet with stable schema) | Messy, nested, evolving, semi-structured (JSON, logs, "stringly typed" CSV) |
-| Transforms | Full Spark SQL / functions API | Glue transforms (`ApplyMapping`, `ResolveChoice`, `Relationalize`, `Unbox`, …) + can drop to Spark via `toDF()` |
-| Catalog integration | Manual | First-class (`from_catalog`, `enableUpdateCatalog`, bookmarks via `transformation_ctx`) |
-| Error handling | Exceptions | Per-record **error capture** (`errorsAsDynamicFrame`, `stageThreshold`) |
-| Performance | Generally faster (no per-record schema overhead) | Slight overhead from self-describing records; great for avoiding full re-reads on drift |
+| Schema | **Fixed** — resolved at read time (`inferSchema`/explicit) | **Self-describing** — per-record; ambiguity preserved as a `choice` type |
+| Type conflicts | Fail at read, or coerce | Captured as a `choice`, resolved later with `resolveChoice` |
+| Best for | Tabular, predictable (CSV/Parquet, stable schema) | Messy, nested, evolving, semi-structured (JSON, logs, dirty CSV) |
+| Transforms | Full Spark SQL / functions | Glue transforms (`ApplyMapping`, `ResolveChoice`, `Relationalize`, `Unbox`, `Join`…) + drop to Spark via `toDF()` |
+| Catalog / bookmarks | Manual / not tracked | First-class (`from_catalog`, `enableUpdateCatalog`, bookmarks via `transformation_ctx`) |
+| Error handling | Exceptions | Per-record capture (`errorsAsDynamicFrame`, `stageThreshold`) |
+| Performance | Generally faster | Slight per-record overhead; avoids re-reads on drift |
 
 > **Why this repo chose `DataFrame`s:** the sources are well-defined business CSVs
-> (AUM, revenue, expense, headcount…) flowing into **typed Redshift tables**. The
-> target schema — not the file — is the contract. A `DataFrame` + explicit
-> reconciliation against `information_schema` gives precise control over Redshift
-> DDL (column order, `DECIMAL(38,18)` precision, `NOT NULL` keys, `VARCHAR`
-> widths). A `DynamicFrame`'s strength (tolerating unknown shape) is less valuable
-> when the destination is a strict relational warehouse.
+> flowing into **typed Redshift tables**. The target schema — not the file — is the
+> contract, and a `DataFrame` + explicit reconciliation gives precise control over
+> Redshift DDL (column order, `DECIMAL(38,18)`, `NOT NULL` keys, `VARCHAR` widths).
 
 ---
 
-## 3. The approach used in this repository
+## 3. The current architecture (DataFrame flow)
 
-Both jobs follow the same schema lifecycle inside `main()`. The Redshift target is
-the source of truth; the incoming CSV is conformed to it.
+Both jobs follow the same schema lifecycle inside `main()`; the Redshift target is the
+source of truth and the incoming CSV is conformed to it.
 
 ```
 read_csv_file()                      # Spark reads CSV, normalises columns, casts types
@@ -101,185 +102,104 @@ create_new_redshift_table()    read_redshift_table_schema()   # SELECT ... WHERE
    │                                alter_redshift_table()     # ADD COLUMN for source cols absent in target
    └──────────────┬───────────────┘
                   ▼
-alter_varchar_columns()              # widen VARCHAR(n) / promote SMALLINT→INT→BIGINT to fit data
+alter_varchar_columns()              # widen VARCHAR(n) / promote SMALLINT→INT→BIGINT
                   ▼
-df.select(<target column order>)     # align DataFrame to the (now reconciled) Redshift schema
+df.select(<target column order>)     # align DataFrame to the reconciled Redshift schema
                   ▼
 coalesce(1).write.csv(staging)  →  COPY → staging table  →  MERGE (delete+insert) → target
+                  ▼
+[data-model job only] dimensions (SCD1/SCD2) → facts (surrogate-key lookups)
+                  ▼
+audit (job_sts) → archive source → export logs
 ```
 
-### 3.1 Reading & normalising the source (`read_csv_file`)
-
-`glue_jobs/without_data_model/glue_job.py:138`
-
-```python
-df = spark.read.option("header", "true").option("inferSchema", "true").csv(source_file)
-
-# normalise column names: lowercase, non-alphanumerics → "_", collapse repeats
-for old in df.columns:
-    new = _clean_colname(old)
-    if old != new:
-        df = df.withColumnRenamed(old, new)
-```
-
-Two deliberate choices happen here:
-
-- **`inferSchema=true`** lets Spark pick types from the data (convenient, but it
-  reads the file twice — see §8.5).
-- **`cast_like`** normalises numerics: any `DoubleType` that is **not** an upsert
-  key is cast to `DECIMAL(38,18)`. This protects monetary/financial precision
-  (floating point drift is unacceptable for AUM, fees, revenue) while leaving join
-  keys untouched.
-- Two audit columns are appended: `run_date` (timestamp) and `file_name`
-  (provenance).
-
-### 3.2 Discovering the target schema (`read_redshift_table_schema`)
-
-`glue_jobs/without_data_model/glue_job.py:215`
-
-The target schema is read **without scanning data** using a zero-row probe:
-
-```python
-sql = f"SELECT * FROM {schema_name}.{table_name} WHERE 1=0;"
-...
-metadata = result["ColumnMetadata"]   # Redshift Data API returns column types even for 0 rows
-```
-
-`map_dtype()` translates Redshift type names back into Spark types, producing an
-**empty typed DataFrame** that acts as a portable schema descriptor. This is the
-linchpin of the whole strategy: the comparison `set(df.columns) != set(redshift_df.columns)`
-drives every evolution decision.
-
-> Note: `read_redshift_table_schema` is called **again** after any DDL change
-> (`glue_job.py:885`) so the column-ordering `select` at the end always reflects
-> the *post-evolution* schema.
+The data-model job (`glue_job_with_data_model.py`) is steps 3.1–3.6 of the simple job
+**plus** config-driven star-schema population (dimensions then facts).
 
 ---
 
 ## 4. Schema evolution strategies (as implemented)
 
-This is "Solution 2 — Explicit Schema Reconciliation" from
+This realises "Solution 2 — Explicit Schema Reconciliation" from
 [`scenario_based_questions.md`](../../scenario_based_questions/scenario_based_questions.md)
-(Scenario 5), realised across several functions.
+(Scenario 5).
 
 ### 4.1 New table — derive DDL from the source (`create_new_redshift_table`)
 
-When the target does not exist, DDL is generated from the Spark schema via
-`_spark_to_redshift_type()`:
+`_spark_to_redshift_type()` maps Spark types to Redshift DDL; upsert keys get `NOT NULL`:
 
 | Spark type | Redshift type |
 |------------|---------------|
 | `StringType` | `VARCHAR(256)` |
-| `IntegerType` | `INTEGER` |
-| `LongType` | `BIGINT` |
+| `IntegerType` / `LongType` | `INTEGER` / `BIGINT` |
 | `DoubleType` | `DOUBLE PRECISION` |
 | `DecimalType` | `DECIMAL(38,18)` |
 | `BooleanType` | `BOOLEAN` |
 | `DateType` / `TimestampType` | `DATE` / `TIMESTAMP` |
 | `BinaryType` | `VARBYTE` |
 
-Upsert-key columns get `NOT NULL`. A reporting view is created afterward
-(`create_views`).
+### 4.2 New columns in source → `ALTER TABLE ADD COLUMN` (`alter_redshift_table`)
 
-### 4.2 New columns in the source → `ALTER TABLE ADD COLUMN` (`alter_redshift_table`)
+`glue_jobs/without_data_model/glue_job.py:331`. Because Redshift views bind to their
+table, the dependent view is **dropped first and recreated after** the `ADD COLUMN`.
+Existing rows get `NULL` for the new column (backward-compatible).
 
-`glue_jobs/without_data_model/glue_job.py:331`
+### 4.3 Columns missing from source → back-fill (`fill_missing_columns`)
 
-For any column present in the source but missing in the target, an
-`ALTER TABLE … ADD COLUMN` is issued. Because Redshift views are bound to their
-underlying table, the dependent view is **dropped first and recreated after**:
-
-```python
-drop_views(...)
-for colf in source_df.schema.fields:
-    if colf.name not in target_cols:
-        execute_sql(f"ALTER TABLE … ADD COLUMN {colf.name} {rtype};", ...)
-create_views(...)   # refresh
-```
-
-This is the additive, backward-compatible case — existing rows get `NULL` for the
-new column.
-
-### 4.3 Columns missing from the source → back-fill (`fill_missing_columns`)
-
-`glue_jobs/without_data_model/glue_job.py:494`
-
-If the target has columns the source lacks (e.g. an older file format), they are
-materialised in the DataFrame with type-appropriate defaults (`get_default_value`):
-empty string for text, `0` for numerics, `None` for dates/timestamps. This keeps
-the CSV→COPY column count aligned with the table.
+`glue_jobs/without_data_model/glue_job.py:494`. Target-only columns are materialised in
+the DataFrame with type-appropriate defaults (`get_default_value`) so the CSV→COPY
+column count stays aligned with the table.
 
 ### 4.4 Widening to fit the data (`alter_varchar_columns`)
 
-`glue_jobs/without_data_model/glue_job.py:373`
+`glue_jobs/without_data_model/glue_job.py:373`. Value-driven evolution:
 
-This handles **value-driven** evolution — the column exists with the right *name*
-but the data no longer fits:
+- **`VARCHAR` widening:** `max(length(col))` (one aggregate row); if it exceeds the
+  current `character_maximum_length`, alter to `VARCHAR(min(maxlen+10, 65535))`.
+- **Integer promotion:** `max(abs(col))`; if it overflows, promote
+  `SMALLINT → INTEGER → BIGINT` via an add→update→drop→rename dance (Redshift can't
+  alter an integer column's type in place).
 
-- **`VARCHAR` widening:** computes `max(length(col))` across the DataFrame in one
-  aggregation; if it exceeds the current `character_maximum_length`, alters to
-  `VARCHAR(min(maxlen + 10, 65535))`.
-- **Integer promotion:** computes `max(abs(col))`; if it overflows the current
-  integer width, promotes `SMALLINT → INTEGER → BIGINT`. Redshift cannot directly
-  change an integer column's type, so it uses an **add-column → update → drop →
-  rename** dance.
-
-Both paths drop/recreate the view and log the altered columns.
-
-> **Why one `.agg().collect()` is safe here:** it returns a *single* row of
-> aggregates (max lengths/magnitudes), not the dataset — so it does not pull data
-> to the driver. Contrast with `df.collect()` on a full DataFrame, which you should
-> avoid (see §8.10).
+> The single `.agg().collect()` returns **one** row of aggregates, not the dataset —
+> it does not pull data to the driver (contrast with `df.collect()`, see §10.10).
 
 ### 4.5 Aligning column order before COPY
 
-Redshift `COPY` from CSV is **positional**. After all DDL, the job re-reads the
-target schema and reorders the DataFrame to match exactly:
-
-```python
-redshift_df = read_redshift_table_schema(config, redshift_conn, spark, client)
-df = df.select(*[c.name for c in redshift_df.schema.fields])
-```
-
-Skipping this would silently load values into the wrong columns — a classic,
-hard-to-spot schema-evolution bug.
+Redshift `COPY` from CSV is **positional**. After all DDL the job re-reads the target
+schema and reorders the DataFrame to match exactly
+(`df.select(*[c.name for c in redshift_df.schema.fields])`, `glue_job.py:887`). Skipping
+this silently loads values into the wrong columns.
 
 ### 4.6 The unsafe-type guard (`check_datatype_matching`)
 
-Only in the simple job (`glue_job.py:698`, currently commented out at the call
-site) is a guard that **refuses** to load when a non-numeric source column maps to
-a numeric target column *and* has non-null values — i.e. it blocks a lossy/garbage
-load rather than letting `COPY` insert nulls or fail opaquely. Worth enabling (or
-porting to the data-model job) as a data-quality gate.
+Only in the simple job (`glue_job.py:698`, currently commented out at the call site): it
+**refuses** to load when a non-numeric source column maps to a numeric target column
+with non-null values — blocking a lossy load rather than failing opaquely. Worth
+enabling.
 
 ### 4.7 What is **not** handled automatically (by design)
 
 | Change | Behaviour | Recommended handling |
 |--------|-----------|----------------------|
-| Column **renamed** in source | Treated as *new* column added + old column back-filled | Maintain a rename map in config; apply before reconciliation |
-| Column **dropped** from source | Back-filled with default (kept in target) | Acceptable; explicit `DROP COLUMN` only via reviewed migration |
-| Type **narrowing** (e.g. `BIGINT`→`INT`) | Never auto-applied | Requires a deliberate, reviewed migration |
-| Incompatible type change (text↔number) | `check_datatype_matching` can reject it | Enable the guard; quarantine the file |
-| Precision/scale change on `DECIMAL` | Standardised to `(38,18)` | Override per-column if business needs differ |
+| Column **renamed** | Treated as add + back-fill | Rename map in config; apply before reconciliation |
+| Column **dropped** from source | Back-filled (kept in target) | Acceptable; explicit `DROP COLUMN` only via reviewed migration |
+| Type **narrowing** | Never auto-applied | Deliberate, reviewed migration |
+| Incompatible type (text↔number) | `check_datatype_matching` can reject | Enable the guard; quarantine the file |
+| `DECIMAL` precision/scale change | Standardised to `(38,18)` | Override per-column if needed |
 
-The deliberate stance: **additive, non-destructive evolution is automatic;
-destructive or lossy changes require a human.**
+**Stance:** additive, non-destructive evolution is automatic; destructive/lossy changes
+require a human.
 
 ---
 
-## 5. AWS Glue DynamicFrames — creation & management
-
-This section answers the explicit question — *how DynamicFrames are created and
-managed* — even though the production jobs use DataFrames. It is the idiomatic Glue
-toolkit for schema drift and semi-structured data.
+## 5. DynamicFrames: creation and management
 
 ### 5.1 What a DynamicFrame is
 
-A `DynamicFrame` is a distributed collection of **self-describing `DynamicRecord`s**.
-Unlike a DataFrame (one schema for all rows), each record can differ, and when Glue
-sees the *same field with different types across records*, it does **not** fail —
-it records a **`choice` type** (e.g. `int|string`) and lets you resolve it
-explicitly later. This is precisely what makes them resilient to schema evolution.
+A distributed collection of **self-describing `DynamicRecord`s**. When the same field
+appears with different types across records, Glue does **not** fail — it records a
+**`choice` type** (e.g. `int|string`) for you to resolve later. That deferral is what
+makes DynamicFrames resilient to schema drift.
 
 ### 5.2 Creating DynamicFrames
 
@@ -290,126 +210,85 @@ from pyspark.context import SparkContext
 
 glueContext = GlueContext(SparkContext.getOrCreate())
 
-# (a) From the Glue Data Catalog (schema + location come from the catalog table).
-#     transformation_ctx is REQUIRED for job bookmarks to track progress.
+# (a) From the Glue Data Catalog. transformation_ctx is REQUIRED for bookmarks (§9).
 dyf = glueContext.create_dynamic_frame.from_catalog(
-    database="ingestion_db",
-    table_name="aum_revenue_raw",
-    transformation_ctx="dyf_aum",
-)
+    database="ingestion_db", table_name="aum_revenue_raw",
+    transformation_ctx="dyf_aum")
 
-# (b) From S3/JDBC directly, no catalog needed (connection + format options).
+# (b) From S3/JDBC directly. format_options handles CSV edge cases (§10.4).
 dyf = glueContext.create_dynamic_frame.from_options(
     connection_type="s3",
     connection_options={"paths": ["s3://bucket/data/in/"], "recurse": True},
     format="csv",
-    format_options={"withHeader": True},
-    transformation_ctx="dyf_s3",
-)
+    format_options={"withHeader": True, "quoteChar": '"', "escaper": '"'},
+    transformation_ctx="dyf_s3")
 
 # (c) From an existing Spark DataFrame (the bridge into Glue transforms).
 dyf = DynamicFrame.fromDF(df, glueContext, "dyf_from_df")
 
-# Inspect inferred (possibly ambiguous) schema:
-dyf.printSchema()          # may show e.g.  amount: choice (double | string)
-dyf.toDF().show(5)
+dyf.printSchema()    # may show e.g.  amount: choice (double | string)
 ```
 
-> The job-bookmarks example in
-> [`scenario_based_questions.md`](../../scenario_based_questions/scenario_based_questions.md)
-> (Scenario 4) uses pattern **(b)** with `transformation_ctx` and then `toDF()`.
-
-### 5.3 Managing DynamicFrames — the core transforms
+### 5.3 Managing DynamicFrames — core transforms
 
 | Transform | Purpose |
 |-----------|---------|
-| `resolveChoice` | Resolve `choice` (ambiguous) columns — the key schema-evolution tool (see §6) |
-| `apply_mapping` / `ApplyMapping` | Rename, reorder, **cast** columns in one declarative step: `[("src","string","tgt","bigint"), …]` |
-| `relationalize` | Flatten nested JSON/arrays into related flat frames (great for loading into relational targets) |
+| `resolveChoice` | Resolve `choice` (ambiguous) columns — the key schema tool (§6) |
+| `apply_mapping` / `ApplyMapping` | Rename, reorder, **cast** in one step: `[("src","string","tgt","bigint"), …]` |
+| `relationalize` | Flatten nested JSON/arrays into related flat frames |
 | `unbox` | Parse a string column containing JSON/CSV into structured fields |
-| `drop_fields` / `select_fields` | Project columns |
+| `select_fields` / `drop_fields` | Project columns |
 | `drop_nulls` / `DropNullFields` | Remove all-null columns |
 | `rename_field` | Rename a single (possibly nested) field |
-| `map` / `filter` | Per-record Python UDF transform / predicate |
-| `join` / `union` / `mergeDynamicFrame` | Combine frames; `mergeDynamicFrame` merges on keys |
+| `map` / `filter` | Per-record Python transform / predicate |
+| `Join.apply` / `union` / `mergeDynamicFrame` | Combine frames; merge on keys |
 | `split_fields` / `split_rows` | Partition a frame into multiple |
-
-```python
-# Declarative cast + rename + reorder — the DynamicFrame equivalent of cast_like()
-mapped = dyf.apply_mapping([
-    ("transaction_id", "string", "transaction_id", "string"),
-    ("revenue",        "string", "revenue",        "decimal(38,18)"),
-    ("report_date",    "string", "report_date",    "date"),
-])
-```
 
 ### 5.4 Per-record error handling
 
-A major DynamicFrame advantage: bad records do not abort the job. Failures are
-captured and inspectable.
-
 ```python
 resolved = dyf.resolveChoice(choice="make_struct")
-errors_dyf = resolved.errorsAsDynamicFrame()        # rows that failed resolution
-print("error count:", resolved.stageErrorsCount())
-# Glue also supports a stageThreshold / totalThreshold to fail only past a tolerance.
+errors_dyf = resolved.errorsAsDynamicFrame()     # rows that failed
+print("errors:", resolved.stageErrorsCount())
+# stageThreshold / totalThreshold let the job tolerate up to N bad records.
 ```
 
 ### 5.5 Writing DynamicFrames
 
 ```python
 glueContext.write_dynamic_frame.from_options(
-    frame=resolved,
-    connection_type="s3",
-    connection_options={"path": "s3://bucket/curated/aum/"},
-    format="parquet",
-)
+    frame=resolved, connection_type="s3",
+    connection_options={"path": "s3://bucket/curated/aum/"}, format="parquet")
 
-# Or via a sink, which can also evolve the Data Catalog (see §6.3):
+# Sink that can also evolve the Data Catalog (§6.3):
 sink = glueContext.getSink(connection_type="s3", path="s3://bucket/curated/aum/",
                            enableUpdateCatalog=True, updateBehavior="UPDATE_IN_DATABASE")
 sink.setCatalogInfo(catalogDatabase="curated_db", catalogTableName="aum")
-sink.setFormat("glueparquet")
-sink.writeFrame(resolved)
+sink.setFormat("glueparquet"); sink.writeFrame(resolved)
 ```
 
 ---
 
-## 6. Schema evolution *with* DynamicFrames
-
-If this pipeline were rebuilt around DynamicFrames, schema evolution would be
-expressed declaratively instead of via `information_schema` reconciliation.
+## 6. Schema evolution with DynamicFrames
 
 ### 6.1 Resolving type conflicts (`resolveChoice`)
 
-When a column arrives as mixed types across files/records, Glue keeps a `choice`.
-You decide how to collapse it:
-
-```python
-# Cast every choice to the widest safe type (e.g. choice<int,string> → string)
-resolved = dyf.resolveChoice(choice="cast:string")
-
-# Keep BOTH representations as a struct (no data loss; resolve downstream)
-resolved = dyf.resolveChoice(choice="make_struct")
-
-# Per-column policy — mirrors this repo's DECIMAL-for-money intent
-resolved = dyf.resolveChoice(specs=[
-    ("revenue", "cast:decimal"),
-    ("flags",   "make_cols"),     # explode choice into revenue_int, revenue_string, …
-])
-```
-
 | `choice` option | Effect |
 |-----------------|--------|
-| `make_cols` | Splits the ambiguous column into one column per observed type |
-| `make_struct` | Wraps both types in a struct — lossless |
-| `cast:<type>` | Forces a single type |
-| `project:<type>` | Keeps only values already of that type |
+| `make_cols` | Split the ambiguous column into one column per observed type |
+| `make_struct` | Wrap both types in a struct — lossless |
+| `cast:<type>` | Force a single type |
+| `project:<type>` | Keep only values already of that type |
+
+```python
+resolved = dyf.resolveChoice(specs=[
+    ("revenue", "cast:decimal"),   # mirrors this repo's DECIMAL-for-money intent
+    ("flags",   "make_struct")])
+```
 
 ### 6.2 Merging evolving datasets (`mergeDynamicFrame`)
 
 ```python
-# Upsert-style merge of an incremental frame into a base frame on natural keys
 merged = base_dyf.mergeDynamicFrame(incremental_dyf, paths=["transaction_id", "report_date"])
 ```
 
@@ -418,480 +297,472 @@ merged = base_dyf.mergeDynamicFrame(incremental_dyf, paths=["transaction_id", "r
 For S3/lakehouse targets, the **sink** can grow the catalog schema as new columns
 appear — the catalog analogue of this repo's `ALTER TABLE ADD COLUMN`:
 
-```python
-sink = glueContext.getSink(
-    connection_type="s3", path="s3://bucket/curated/aum/",
-    enableUpdateCatalog=True,
-    updateBehavior="UPDATE_IN_DATABASE",          # add new columns to the catalog table
-    partitionKeys=["report_date"],
-)
-sink.setCatalogInfo(catalogDatabase="curated_db", catalogTableName="aum")
-sink.setFormat("glueparquet")
-sink.writeFrame(resolved)
-```
-
 | Mechanism | Where evolution lands |
 |-----------|-----------------------|
 | `resolveChoice` | In-memory type unification |
 | `enableUpdateCatalog` + `updateBehavior=UPDATE_IN_DATABASE` | Glue Data Catalog table definition |
 | Crawler with an update policy | Catalog (scheduled, out-of-band) |
-| Parquet/Delta/Iceberg `mergeSchema` | The physical table format (see `glue_features.md`) |
+| Parquet/Delta/Iceberg `mergeSchema` | The physical table format |
 
-### 6.4 Open table formats (the modern alternative)
+> **Important limitation:** `enableUpdateCatalog` evolves the **Glue Data Catalog**,
+> *not* a Redshift table reached over JDBC. Against a Redshift target you still issue
+> explicit `ALTER TABLE` (see §7 load group and §8.2).
 
-Per [`glue_features.md`](../../glue_features/glue_features.md), Glue 5.0 ships
-Iceberg 1.7.1 / Delta 3.3.0 / Hudi 0.15.0. For a data-lake target these handle
-schema evolution natively (`mergeSchema`, `ALTER TABLE ADD COLUMNS`, column
-mapping) and add time-travel/branching — often a better fit than hand-rolled
-reconciliation **when the target is the lake** rather than Redshift.
+### 6.4 Open table formats
+
+Per [`glue_features.md`](../../glue_features/glue_features.md), Glue 5.0 ships Iceberg
+1.7.1 / Delta 3.3.0 / Hudi 0.15.0 — native schema evolution (`mergeSchema`, `ADD
+COLUMNS`, column mapping) plus time-travel/branching. Often the better fit **when the
+target is a data lake** rather than Redshift.
 
 ---
 
-## 7. Building the entire ELT on DynamicFrames (module-by-module)
+## 7. Complete module reference (every function, today and on DynamicFrames)
 
-This section answers: *if we wanted to build **every module** of the ELT script on
-DynamicFrames — schema evolution included — how would we approach it?* It is a
-**design alternative**, not a description of the current code. Read it as the
-blueprint you'd follow if you re-platformed the jobs onto the idiomatic Glue stack.
+Every function in both jobs, grouped by concern. **"Today"** = the current DataFrame
+implementation; **"On DynamicFrames"** = how that module changes / how it helps schema
+handling if rebuilt. Functions marked 🟰 are frame-agnostic (port unchanged); ✳️ change;
+❌ are eliminated.
 
-The single biggest architectural shift is the **load path**: Glue's native Redshift
-connector (`write_dynamic_frame`) replaces the manual
-`coalesce(1) → S3 CSV → COPY → staging table → MERGE` plumbing with one call that
-takes `preactions` / `postactions`. Type handling moves into `apply_mapping` +
-`resolveChoice`. Schema evolution splits by target: **automatic** for an
-S3/Data-Catalog target (`enableUpdateCatalog`), but still **explicit** for Redshift
-(the connector does *not* `ALTER` Redshift tables for you — see §7.4).
+### 7.1 Initialisation, logging, resilience
 
-### 7.1 Module map — what changes, what stays
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `LogBuffer` (`info`/`warning`/`error`/`export_to_s3`, `_ts`) | Structured JSON logs → CloudWatch + S3, keyed by `run_id` | 🟰 Unchanged. Additionally log `dyf.stageErrorsCount()` / `errorsCount()` for per-record visibility |
+| `retry_on_exception` | Exponential-backoff decorator (5→120s, 3 attempts) on Data API calls | 🟰 Unchanged — still wraps Data API/DDL; the connector handles COPY/merge retries internally |
+| `initialize_glue` | `GlueContext` + `Job`; `job.init(name, args)` | ✳️ Same, but **`job.init` + `job.commit` + `transformation_ctx` are mandatory for bookmarks** (§9) |
 
-| Current module (function) | Today (DataFrame) | Rebuilt on DynamicFrames |
-|---------------------------|-------------------|--------------------------|
-| Init (`initialize_glue`) | `GlueContext` + `Job` | **Unchanged** |
-| Ingest (`read_csv_file`) | `spark.read.csv` | `create_dynamic_frame.from_options/from_catalog` + `transformation_ctx` (§7.2) |
-| Normalise + cast (`_clean_colname`, `cast_like`) | `withColumnRenamed`, `F.col().cast()` | `apply_mapping` + `resolveChoice` (§7.3) |
-| Schema discovery (`read_redshift_table_schema`) | `SELECT … WHERE 1=0` probe | Same probe; compare against **resolved DynamicFrame schema** (§7.4) |
-| Evolution (`alter_redshift_table`, `fill_missing_columns`, `alter_varchar_columns`) | `ALTER TABLE` via Data API + back-fill | Drift → **`preactions`** on the sink; back-fill via `apply_mapping` (§7.4) |
-| Load + upsert (`write` + `create_staging_table` + `copy_to_redshift` + `run_merge`) | Manual S3 + COPY + DELETE/INSERT | **`write_dynamic_frame` with `preactions`/`postactions`** (§7.5) |
-| Dimensions/facts (`process_*`) | Spark select/join + SP calls | `SelectFields`/`apply_mapping`/`Join` + SP calls as `postactions` (§7.6) |
-| Data-quality guard (`check_datatype_matching`) | Type check, raise | `resolveChoice("make_struct")` + `errorsAsDynamicFrame` + Glue DQ (§7.7) |
-| Audit / logging / retries / archive | boto3 + `LogBuffer` | **Unchanged** — orthogonal to the frame type (§7.8) |
+### 7.2 Source read & column normalisation
 
-> Two modules carry most of the benefit (ingest + load); the warehouse-side SQL
-> (merge, SCD, fact loads) is best left in the existing **stored procedures**,
-> invoked as connector `postactions`.
-
-### 7.2 Module: Ingest
-
-Create the DynamicFrame at the S3/catalog boundary. `transformation_ctx` is what
-wires in **job bookmarks** (incremental file tracking).
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `read_csv_file` | `spark.read.csv(header, inferSchema)` + rename + `cast_like` + audit cols | ✳️ `create_dynamic_frame.from_options(... format="csv", transformation_ctx=...)`. Gains: **bookmarks**, **malformed-record capture**, deferred typing via `choice` |
+| `_clean_colname` | Lowercase, non-alphanumeric→`_`, collapse repeats | ✳️ Folded into `apply_mapping` target names (rename lives in the mapping spec) |
+| `cast_like` (inner) | Non-key `double → decimal(38,18)`; cast to inferred types | ✳️ `resolveChoice` settles ambiguity, then `apply_mapping` casts/reorders declaratively (§8.1) |
 
 ```python
-def read_source(config, glueContext):
-    source = f"s3://{config['src_bucket']}/data/in/{config['source_file_name']}"
-    dyf = glueContext.create_dynamic_frame.from_options(
-        connection_type="s3",
-        connection_options={"paths": [source]},
-        format="csv",
-        format_options={"withHeader": True},
-        transformation_ctx=f"read_{config['target_table']}",   # ← bookmarks key
-    )
-    return dyf
+# read_csv_file → DynamicFrame equivalent
+dyf = glueContext.create_dynamic_frame.from_options(
+    connection_type="s3",
+    connection_options={"paths": [f"s3://{bkt}/data/in/{fname}"]},
+    format="csv", format_options={"withHeader": True},
+    transformation_ctx=f"read_{target_table}")          # ← enables bookmarks
+dyf = dyf.resolveChoice(choice="cast:string")           # or make_struct to keep both
 ```
 
-### 7.3 Module: Type conform & column normalisation
+### 7.3 Schema discovery & evolution
 
-The DataFrame job renames columns then casts (`cast_like`: non-key `double →
-decimal(38,18)`). On DynamicFrames this is one declarative `apply_mapping`, with
-`resolveChoice` to settle any mixed-type columns first.
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `read_redshift_table_schema` (+ `map_dtype`) | `SELECT … WHERE 1=0` → `ColumnMetadata` → typed empty DF | 🟰 Still the schema authority; compare against `dyf.toDF().schema` instead of `df.schema` |
+| `check_table_exists` | `information_schema.tables` lookup | 🟰 Unchanged |
+| `_spark_to_redshift_type` | Spark type → Redshift DDL string | 🟰 Still needed to render `CREATE`/`ALTER` DDL (Glue types map 1:1) |
+| `create_new_redshift_table` | DDL from schema; `NOT NULL` keys; create view | ✳️ Drive DDL from the **resolved** frame schema; or let a `CREATE TABLE AS` preaction do it |
+| `alter_redshift_table` | `ADD COLUMN` for new source cols (drop/recreate view) | ✳️ Emit the same `ADD COLUMN` as connector **`preactions`** — connector won't auto-`ALTER` Redshift |
+| `get_metadata` | `SVV_COLUMNS` → lengths/types for widening | 🟰 Unchanged (introspection for §4.4) |
+| `alter_varchar_columns` | Widen `VARCHAR`; promote `SMALLINT→INT→BIGINT` | ✳️ Same aggregates; widening `ALTER`s become `preactions`; `resolveChoice` first-classes type ambiguity |
+| `get_default_value` | Type → default literal for back-fill | 🟰 Reused by back-fill (`withColumn`/`apply_mapping`) |
+| `fill_missing_columns` | Add target-only columns with defaults | ✳️ Same logic on `toDF()` then back to a frame, or via `apply_mapping` |
+
+### 7.4 Staging, COPY, and merge (the load path — biggest change)
+
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `df.coalesce(1).write.csv` | Single-file CSV to S3 staging prefix | ❌ Eliminated — the connector writes to `redshiftTmpDir` itself |
+| `_find_single_csv_in_prefix` | Locate the one part-file for COPY | ❌ Eliminated |
+| `create_staging_table` | `CALL sp_create_staging_table(...)` | ✳️ Becomes a connector **`preaction`** (`CREATE TABLE … LIKE …`) |
+| `copy_to_redshift` | `CALL sp_copy_from_s3(...)` | ❌ Eliminated — connector runs `COPY` internally |
+| `run_merge` | `CALL sp_merge_from_staging(...)` (DELETE+INSERT) | ✳️ Becomes a connector **`postaction`** (same SP, or inline DELETE/INSERT) |
+| `get_row_count` | `COUNT(*)` for audit deltas | 🟰 Unchanged; or use `dyf.count()` |
+| `_poll_statement` / `execute_sql` | Redshift Data API submit + poll | ✳️ Still used for DDL/SP via Data API; load SQL moves into pre/postactions |
+
+> One `write_dynamic_frame` call (§8.2) replaces `write` + `_find_single_csv_in_prefix`
+> + `create_staging_table` + `copy_to_redshift` + `run_merge`.
+
+### 7.5 Reporting views
+
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `_load_view_config` | Load `config_view.json` from S3 | 🟰 Unchanged |
+| `create_views` / `drop_views` | `CREATE/DROP VIEW` via Data API around DDL | 🟰 Unchanged. (For a catalog target, multi-dialect Glue Catalog views are an alternative — `glue_features.md` §L) |
+
+### 7.6 Data quality
+
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `check_datatype_matching` (simple job) | Reject lossy text→number loads | ✳️ `resolveChoice("make_struct")` + `errorsAsDynamicFrame` to quarantine, plus **Glue Data Quality** (`EvaluateDataQuality`, DQDL) as a declarative gate |
+
+### 7.7 Audit & S3 lifecycle
+
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `update_job_sts_table` | Write run row to `job_sts` | 🟰 Unchanged; can add `dyf` error counts |
+| `move_s3_file_to_archive` | Copy to `data/archive/…`, delete source | 🟰 Unchanged (boto3). Note Glue's `purge_s3_path`/`purge_table` as alternatives |
+| `delete_staging_s3_files` | Remove staging CSVs | ✳️ Largely redundant — the connector manages `redshiftTmpDir` |
+| `move_s3_file_to_unprocessed` | Move failed file to `data/unprocessed/…` | 🟰 Unchanged |
+
+### 7.8 Dimensional model (data-model job only)
+
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `load_dimensional_config` | Load `dimensional_mappings.json` | 🟰 Unchanged |
+| `process_dimension_from_config` (SCD2) | Select + dedupe + SCD meta + COPY + `sp_process_scd_type2` | ✳️ `apply_mapping` (column_mappings) + `select_fields` + `dropDuplicates`; SCD2 SP as **`postaction`** |
+| `process_scd_type1_dimension` (SCD1) | Same shape, `sp_process_scd_type1` | ✳️ Same; SCD1 SP as `postaction` |
+| `process_fact_from_config` | Stage natural keys + `sp_load_fact_table` (joins in Redshift) | ✳️ `Join.apply` for surrogate lookups, **or** keep the in-Redshift join SP (simpler); load via connector |
+
+> **Honest call:** DynamicFrames add little to the **star-schema SQL**. Keep
+> `03_scd_type2.sql` / `04_scd_type1.sql` / `05_fact_loader.sql` and invoke them as
+> `postactions`; use DynamicFrames for ingest/typing/loading.
+
+### 7.9 Entry point
+
+| Function | Today | On DynamicFrames |
+|----------|-------|------------------|
+| `main` | Orchestrates the flow; `job.commit()` | ✳️ See `main_dynamic()` skeleton (§8.4); ensure a stable `transformation_ctx` and `job.commit()` so bookmarks advance |
+
+---
+
+## 8. Building the entire ELT on DynamicFrames
+
+A forward-looking **design** (not the current code). The biggest shift is the load
+path; schema evolution against Redshift stays explicit (§6.3 limitation).
+
+### 8.1 Type conform — `apply_mapping` + `resolveChoice`
 
 ```python
 def conform(dyf, config):
-    # 1) Settle ambiguity. Keep both representations rather than guessing:
-    dyf = dyf.resolveChoice(specs=[(c, "make_struct") for c in dyf.toDF().columns])
-    # (or, simply: dyf.resolveChoice(choice="cast:string") and retype below)
-
-    # 2) Rename + cast + reorder in one step. Mirrors cast_like()'s DECIMAL rule.
-    upsert = set(k.lower() for k in config["upsert_keys"])
+    dyf = dyf.resolveChoice(choice="cast:string")        # settle ambiguity first
+    upsert = {k.lower() for k in config["upsert_keys"]}
     mappings = []
     for f in dyf.toDF().schema.fields:
-        src = f.name
-        tgt = _clean_colname(src)
+        tgt = _clean_colname(f.name)
         tgt_type = "decimal(38,18)" if (_is_double(f.dataType) and tgt not in upsert) \
                    else _glue_type(f.dataType)
-        mappings.append((src, _glue_type(f.dataType), tgt, tgt_type))
-    return dyf.apply_mapping(mappings)
+        mappings.append((f.name, _glue_type(f.dataType), tgt, tgt_type))
+    return dyf.apply_mapping(mappings)                   # rename + cast + reorder in one step
 ```
 
-> `apply_mapping` is also the clean home for a **column-rename map** (§4.7): list the
-> old name as source and the new name as target, and renames stop looking like
-> "add + drop".
-
-### 7.4 Module: Schema discovery & evolution (against Redshift)
-
-**Be clear-eyed here:** the Glue Redshift connector loads data but does **not**
-alter the Redshift table to match the frame. `enableUpdateCatalog` evolves the
-**Glue Data Catalog**, not a Redshift table reached over JDBC. So for a Redshift
-target you keep an explicit reconciliation step — but now you drive it from the
-**resolved DynamicFrame schema** and emit the DDL as connector **`preactions`** so
-schema change + load happen atomically in one sink call.
-
-```python
-def build_preactions(dyf, config, redshift_conn, client):
-    """Compute Redshift schema drift and return (preactions_sql, aligned_dyf)."""
-    target = read_redshift_table_schema(config, redshift_conn, spark, client)  # reuse probe
-    tgt_cols = {f.name: f.dataType for f in target.schema.fields}
-    src_cols = {f.name: f.dataType for f in dyf.toDF().schema.fields}
-    schema, table = redshift_conn["schema_name"], config["target_table"]
-
-    pre = [f"CREATE TABLE IF NOT EXISTS {schema}.{table}_stg (LIKE {schema}.{table});",
-           f"TRUNCATE TABLE {schema}.{table}_stg;"]
-
-    # New source columns → ADD COLUMN to BOTH target and staging (additive evolution)
-    for name, dt in src_cols.items():
-        if name not in tgt_cols and _valid_ident(name):           # §8.7 hardening
-            rtype = _spark_to_redshift_type(dt)
-            pre.append(f"ALTER TABLE {schema}.{table} ADD COLUMN {name} {rtype};")
-            pre.append(f"ALTER TABLE {schema}.{table}_stg ADD COLUMN {name} {rtype};")
-
-    # Target columns missing from source → back-fill in the frame (not in SQL)
-    df = dyf.toDF()
-    for name, dt in tgt_cols.items():
-        if name not in src_cols:
-            df = df.withColumn(name, F.lit(get_default_value(dt)))
-    aligned = DynamicFrame.fromDF(df.select(*tgt_cols.keys()), glueContext, "aligned")
-    return ";\n".join(pre), aligned
-```
-
-- **New columns** become `ALTER TABLE … ADD COLUMN` preactions (the DynamicFrame
-  equivalent of `alter_redshift_table`).
-- **Missing columns** are back-filled in the frame with `withColumn` (equivalent of
-  `fill_missing_columns`).
-- **VARCHAR/INT widening** (`alter_varchar_columns`) is unchanged in spirit: compute
-  `max(length)` / `max(abs)` (one aggregate row — cheap), and append the widening
-  `ALTER`s to `preactions`.
-- **Type ambiguity** that the DataFrame path could not see is now first-classed by
-  `resolveChoice` in §7.3 — a genuine *gain*.
-
-### 7.5 Module: Load + upsert (the big win)
-
-This replaces five functions (`df.write`, `_find_single_csv_in_prefix`,
-`create_staging_table`, `copy_to_redshift`, `run_merge`) with **one** connector
-call. The connector writes the frame to `redshift_tmp_dir` and runs the `COPY`
-internally; `preactions` create/evolve staging, `postactions` run the
-delete/insert merge and drop staging.
+### 8.2 Schema evolution + load + merge — one connector call
 
 ```python
 def load_and_merge(dyf, config, redshift_conn, client):
-    pre, aligned = build_preactions(dyf, config, redshift_conn, client)
     schema, table = redshift_conn["schema_name"], config["target_table"]
+    target = read_redshift_table_schema(config, redshift_conn, spark, client)  # reuse probe
+    tgt = {f.name: f.dataType for f in target.schema.fields}
+    src = {f.name: f.dataType for f in dyf.toDF().schema.fields}
+
+    pre = [f"CREATE TABLE IF NOT EXISTS {schema}.{table}_stg (LIKE {schema}.{table});",
+           f"TRUNCATE TABLE {schema}.{table}_stg;"]
+    for name, dt in src.items():                          # additive evolution → preactions
+        if name not in tgt and _valid_ident(name):        # §10.7 identifier hardening
+            rtype = _spark_to_redshift_type(dt)
+            pre += [f"ALTER TABLE {schema}.{table} ADD COLUMN {name} {rtype};",
+                    f"ALTER TABLE {schema}.{table}_stg ADD COLUMN {name} {rtype};"]
+
+    df = dyf.toDF()                                        # back-fill target-only columns
+    for name, dt in tgt.items():
+        if name not in src:
+            df = df.withColumn(name, F.lit(get_default_value(dt)))
+    aligned = DynamicFrame.fromDF(df.select(*tgt.keys()), glueContext, "aligned")
+
     keys = config["upsert_keys"]
     on = " AND ".join(f"{table}.{k} = {table}_stg.{k}" for k in keys)
-
-    post = (
-        f"BEGIN;"
-        f"DELETE FROM {schema}.{table} USING {schema}.{table}_stg WHERE {on};"
-        f"INSERT INTO {schema}.{table} SELECT * FROM {schema}.{table}_stg;"
-        f"DROP TABLE {schema}.{table}_stg;"
-        f"END;"
-    )
-    # You can equally call the existing SP: postactions=f"CALL public.sp_merge_from_staging(...)"
+    post = (f"BEGIN;"
+            f"DELETE FROM {schema}.{table} USING {schema}.{table}_stg WHERE {on};"
+            f"INSERT INTO {schema}.{table} SELECT * FROM {schema}.{table}_stg;"
+            f"DROP TABLE {schema}.{table}_stg; END;")
+    # …or: postactions = f"CALL public.sp_merge_from_staging('{schema}','{table}','{table}_stg','{','.join(keys)}')"
 
     glueContext.write_dynamic_frame.from_options(
-        frame=aligned,
-        connection_type="redshift",
+        frame=aligned, connection_type="redshift",
         connection_options={
             "redshiftTmpDir": redshift_conn["tmp_dir"],
-            "useConnectionProperties": "true",
-            "dbtable": f"{schema}.{table}_stg",   # load into staging…
             "connectionName": "redshift-glue-connection",
-            "preactions":  pre,                    # …create/evolve it first
-            "postactions": post,                   # …then MERGE into target
+            "dbtable": f"{schema}.{table}_stg",
+            "preactions":  ";\n".join(pre),
+            "postactions": post,
         },
-        transformation_ctx=f"load_{table}",
-    )
+        transformation_ctx=f"load_{table}")
 ```
 
-> **What you no longer maintain:** the single-file `coalesce(1)` write, the
-> "find the one CSV under the prefix" helper, manual `COPY` SQL, and staging-file
-> cleanup. The connector owns the S3 temp round-trip.
+### 8.3 Pure-Glue variant — S3/Catalog target = *automatic* schema evolution
 
-### 7.6 Module: Dimensional model (SCD 1/2 + facts)
-
-The dimensional functions are mostly *projection + dedupe + SQL*. DynamicFrame
-transforms cover the projection cleanly; the relational merge logic stays in the
-stored procedures, called as `postactions`.
-
-```python
-def process_dimension_dyf(dyf, dim_config, redshift_conn):
-    # column_mappings (target ← source) via apply_mapping
-    maps = [(src, "string", tgt, "string") for tgt, src in dim_config["column_mappings"].items()]
-    dim = dyf.apply_mapping(maps).select_fields(list(dim_config["column_mappings"].keys()))
-    dim = DynamicFrame.fromDF(dim.toDF().dropDuplicates(), glueContext, "dim")  # distinct
-
-    glueContext.write_dynamic_frame.from_options(
-        frame=dim, connection_type="redshift",
-        connection_options={
-            "connectionName": "redshift-glue-connection",
-            "redshiftTmpDir": redshift_conn["tmp_dir"],
-            "dbtable": f"{redshift_conn['schema_name']}.stg_{dim_config['dimension_table']}",
-            "preactions":  "CREATE TABLE IF NOT EXISTS …; TRUNCATE …;",
-            "postactions": f"CALL public.sp_process_scd_type2(…);",   # reuse existing SP
-        },
-        transformation_ctx=f"dim_{dim_config['dimension_table']}",
-    )
-```
-
-- **Facts** need surrogate-key lookups — i.e. joins. Use `Join.apply(factDyf, dimDyf,
-  …)` for the DynamicFrame-native path, or drop to Spark (`toDF()`) for complex
-  multi-dimension joins, then load. The repo's `sp_load_fact_table` postaction
-  approach (join in Redshift after staging the natural keys) remains the simplest.
-- **`relationalize`** would matter if a source were nested JSON (flatten arrays into
-  child frames before loading); the current CSV sources are flat, so it is not
-  needed — but it is the tool you'd reach for if inputs gained nesting.
-
-> **Honest call:** DynamicFrames add little to the star-schema *SQL*. Keep the
-> stored procedures (`03_scd_type2.sql`, `04_scd_type1.sql`, `05_fact_loader.sql`)
-> and invoke them as `postactions`. Use DynamicFrames for ingest/typing/loading.
-
-### 7.7 Module: Data quality & error capture
-
-`check_datatype_matching` becomes richer and non-fatal-by-default:
-
-```python
-resolved = dyf.resolveChoice(choice="make_struct")   # don't lose ambiguous values
-bad = resolved.errorsAsDynamicFrame()                 # quarantine instead of crashing
-if resolved.stageErrorsCount() > config.get("error_threshold", 0):
-    glueContext.write_dynamic_frame.from_options(
-        frame=bad, connection_type="s3",
-        connection_options={"path": f"s3://{config['src_bucket']}/data/quarantine/"},
-        format="json")
-    raise RuntimeError(f"{resolved.stageErrorsCount()} bad records exceeded threshold")
-```
-
-Pair this with a **Glue Data Quality** ruleset (`EvaluateDataQuality`, DQDL) as a
-declarative gate — the modern replacement for hand-written type checks, and a
-natural companion to `stored_procedures/07_data_quality.sql`.
-
-### 7.8 Modules that stay the same
-
-Audit (`update_job_sts_table`), structured logging (`LogBuffer`), retry/backoff
-(`retry_on_exception`), and S3 archive/cleanup are **boto3 utilities independent of
-the frame type** — port them unchanged. `job.commit()` (already present) is what
-persists bookmark state from §7.2.
-
-### 7.9 The "pure-Glue" variant — S3 / Lakehouse target = *automatic* schema evolution
-
-If the warehouse contract allowed an **S3 / Data-Catalog** target (Parquet/Iceberg/
-Delta) instead of a Redshift table, schema evolution becomes fully automatic and
-the §7.4 reconciliation module disappears:
+If the target could be an S3/Data-Catalog table (Parquet/Iceberg/Delta) instead of
+Redshift, the §8.2 reconciliation disappears entirely:
 
 ```python
 sink = glueContext.getSink(
     connection_type="s3", path="s3://bucket/curated/aum/",
-    enableUpdateCatalog=True,
-    updateBehavior="UPDATE_IN_DATABASE",      # new columns auto-added to the catalog
-    partitionKeys=["report_date"],
-)
+    enableUpdateCatalog=True, updateBehavior="UPDATE_IN_DATABASE",
+    partitionKeys=["report_date"])
 sink.setCatalogInfo(catalogDatabase="curated_db", catalogTableName="aum")
-sink.setFormat("glueparquet")
-sink.writeFrame(resolved)
-# Redshift then reads via Spectrum / Lakehouse (see glue_features.md §S, §L)
+sink.setFormat("glueparquet"); sink.writeFrame(resolved)
+# Redshift reads via Spectrum / Lakehouse (glue_features.md §S, §L)
 ```
 
-This is the only configuration where DynamicFrames give you *hands-off* schema
-evolution end-to-end. Against a strict Redshift table you always keep an explicit
-DDL step (§7.4) — which is exactly why the current design uses DataFrames.
+This is the **only** configuration with hands-off, end-to-end schema evolution.
 
-### 7.10 End-to-end skeleton
+### 8.4 End-to-end skeleton
 
 ```python
 def main_dynamic():
     spark, glueContext, job = initialize_glue(config["job_name"])
-    dyf = read_source(config, glueContext)                 # §7.2 ingest + bookmarks
-    dyf = conform(dyf, config)                             # §7.3 resolveChoice + apply_mapping
-    dyf = add_audit_fields(dyf)                            # run_date / file_name (Map or toDF)
-    dyf = quality_gate(dyf, config)                        # §7.7 errors → quarantine
+    dyf = read_source(config, glueContext)              # §7.2 ingest + bookmarks
+    dyf = conform(dyf, config)                           # §8.1 resolveChoice + apply_mapping
+    dyf = add_audit_fields(dyf)                          # run_date / file_name
+    dyf = quality_gate(dyf, config)                      # §7.6 errors → quarantine
     if check_table_exists(redshift_conn, config, client):
-        load_and_merge(dyf, config, redshift_conn, client)  # §7.4 preactions + §7.5 connector
+        load_and_merge(dyf, config, redshift_conn, client)   # §8.2
     else:
         create_new_redshift_table(config, redshift_conn, dyf.toDF(), client, log)
         load_and_merge(dyf, config, redshift_conn, client)
-    process_dimensional_model(dyf, config, redshift_conn)  # §7.6 (data-model job only)
-    update_job_sts_table(...)                              # §7.8 unchanged
-    job.commit()                                           # persist bookmark
+    process_dimensional_model(dyf, config, redshift_conn)    # §7.8 (data-model job)
+    update_job_sts_table(...)                            # §7.7 unchanged
+    job.commit()                                          # persist bookmark (§9)
 ```
 
-### 7.11 Trade-offs of the DynamicFrame rebuild
+### 8.5 Gains vs costs of the rebuild
 
 | You gain | You pay |
 |----------|---------|
-| `resolveChoice` first-classes mixed-type columns the DataFrame path can't see | `choice` types can mask real data problems if blindly `cast` |
-| Connector-managed `COPY` — delete ~5 functions of S3/COPY plumbing | The Redshift connector needs a **Glue JDBC Connection + VPC route**, losing the **Data API's no-VPC simplicity** the repo deliberately chose (`data_pipeline_logic.md`) |
-| Per-record error capture + quarantine (`errorsAsDynamicFrame`) | Manage `redshiftTmpDir` lifecycle/permissions |
-| Job bookmarks via `transformation_ctx` | Redshift DDL evolution **still not automatic** — you keep §7.4 (now schema-driven, run as `preactions`) |
-| **Automatic** catalog schema evolution *iff* the target is S3/Catalog (§7.9) | Slight per-record overhead vs DataFrames |
-
-**Bottom line:** a DynamicFrame rebuild is most compelling if (a) inputs become
-messy/semi-structured, (b) you want connector-managed loads and bookmarks, or
-(c) the target moves to an S3/Lakehouse table where schema evolution is automatic.
-For a strict Redshift target with clean CSVs, the current DataFrame design stays
-competitive — and you can adopt DynamicFrames **surgically at the ingest edge**
-(§7.2–7.3) without rewriting the load path.
+| `resolveChoice` first-classes mixed types the DataFrame path can't see | `choice` types can mask real data issues if blindly `cast` |
+| Connector-managed `COPY` — delete ~5 functions of S3/COPY plumbing | Connector needs a **Glue JDBC Connection + VPC route**, losing the **Data API's no-VPC simplicity** the repo chose (`data_pipeline_logic.md`) |
+| Per-record error capture + quarantine | Manage `redshiftTmpDir` lifecycle/permissions |
+| Job bookmarks via `transformation_ctx` (§9) | Redshift DDL evolution **still not automatic** — keep §8.2 as `preactions` |
+| **Automatic** catalog evolution iff target is S3/Catalog (§8.3) | Slight per-record overhead |
 
 ---
 
-## 8. Other important scenarios & best practices
+## 9. Glue job bookmarks: schema, keys, and failure modes
 
-These are grounded in what the jobs already do well, plus gaps worth closing.
+Job bookmarks let a job **process only new data** across runs by persisting state
+between runs. This section covers how they're enabled, **how schema/keys are defined**,
+and **when they fail** — with the repo-specific reality up front.
 
-### 8.1 Idempotency & exactly-once (implemented)
+### 9.1 The reality in this repo (read this first)
 
-The MERGE is a **delete-then-insert on upsert keys** (`sp_merge_from_staging`,
-`stored_procedures/02_merge_upsert.sql`), wrapped so re-running the same file
-yields the same result. Combined with **SQS FIFO + Lambda reserved concurrency 1 +
-Step Functions `MaxConcurrency: 1`**, the pipeline avoids concurrent writers to the
-same table. Keep upsert keys genuinely unique, or duplicates collapse silently.
+Both jobs read with **`spark.read.csv`** (`glue_job.py:142`) and call `job.init` /
+`job.commit` — but with **no `transformation_ctx` and no DynamicFrame reader**.
 
-### 8.2 Staging table + COPY + MERGE (implemented)
+> **Consequence: bookmarks are inert here.** Bookmarks only track sources read through
+> the Glue readers (`create_dynamic_frame.from_options` / `from_catalog`, or
+> `create_data_frame.from_catalog`) **with a `transformation_ctx`**. A plain
+> `spark.read` does **not** participate, so `job.commit()` advances no source state.
 
-Never `INSERT` row-by-row into Redshift. The job writes one CSV, `COPY`s into a
-staging table, then MERGEs. `COPY` is massively parallel; the staging hop makes the
-upsert atomic and lets the load fail without partially mutating the target.
+Incrementality today is achieved differently and correctly: **one S3 `ObjectCreated`
+event → one file processed → file archived/deleted**, so a file is never seen twice.
+You only need bookmarks if you switch to **batch-reading a folder** of many files.
 
-### 8.3 `coalesce(1)` before COPY (implemented — know the trade-off)
+### 9.2 Enabling bookmarks
 
-`df.coalesce(1)` forces a single output file so `COPY` reads a consistent object and
-header handling is unambiguous. **Cost:** it funnels the final write through one
-task — fine for these report-sized files, but for multi-GB outputs prefer multiple
-files (Redshift `COPY` parallelises across them) or write a manifest.
+Three modes via the `--job-bookmark-option` job parameter:
 
-### 8.4 Run-isolated staging paths (implemented)
+| Value | Behaviour |
+|-------|-----------|
+| `job-bookmark-enable` | Track state; skip already-processed data |
+| `job-bookmark-disable` | Off (default) |
+| `job-bookmark-pause` | Process the same increment again **without** advancing state |
 
-Staging S3 prefixes are keyed by `run_id` (`…/{target_table}_{staging}/{run_id}`),
-so concurrent or retried runs never clobber each other's files. Staging tables are
-likewise suffixed with a UUID in the data-model job.
+Required code: `job.init(jobName, args)` at start, **`transformation_ctx` on each
+source/sink**, and `job.commit()` at the end. State identity = *(job name +
+`transformation_ctx` + run number)*.
 
-### 8.5 `inferSchema` reads the file twice (gap)
+### 9.3 How "schema" / keys are defined on bookmarks
 
-`inferSchema=true` triggers an extra full pass before processing. For large inputs,
-pass an **explicit schema** (you already build typed schemas from Redshift — reuse
-that), or read everything as string and cast deliberately. Saves a whole scan.
+Bookmarks don't store a row schema; they store a **position**. How that position is
+defined depends on the source type:
 
-### 8.6 Job bookmarks for incremental ingest (recommended)
+**S3 sources** — no key columns. Glue tracks **object key + last-modified timestamp**.
+On each run it processes objects whose modification time is **newer** than the last
+committed timestamp.
 
-Today the pipeline is one-file-per-trigger. For folder-level or re-driven loads,
-enable bookmarks (`--job-bookmark-option=job-bookmark-enable`) and set a stable,
-unique `transformation_ctx` per source, then `job.commit()` (already called). See
-`scenario_based_questions.md` Scenario 4.
+```python
+dyf = glueContext.create_dynamic_frame.from_options(
+    connection_type="s3",
+    connection_options={"paths": ["s3://bucket/data/in/"], "recurse": True},
+    format="csv", format_options={"withHeader": True},
+    transformation_ctx="ingest_aum")        # ← the bookmark identity for this source
+```
 
-### 8.7 SQL string-building / injection hardening (gap — important)
+**JDBC / relational sources** — you **define bookmark keys** (the columns that act as
+the high-water mark). These must be **unique and monotonically increasing**:
 
-Most DDL/DML is assembled with f-strings from config and column names, e.g.
-`f"ALTER TABLE {schema}.{table} ADD COLUMN {col} {rtype};"`. The audit writer
-escapes quotes (`update_job_sts_table`), but identifiers are not validated. Because
-`target_table`/`upsert_keys`/column names flow from `config.json` and file headers,
-treat those as **trusted-but-verify**:
+```python
+dyf = glueContext.create_dynamic_frame.from_catalog(
+    database="src_db", table_name="transactions",
+    transformation_ctx="ingest_txn",
+    additional_options={
+        "jobBookmarkKeys": ["transaction_id"],     # one or more columns
+        "jobBookmarkKeysSortOrder": "asc"})        # 'asc' or 'desc'
+```
 
-- Validate identifiers against `^[A-Za-z_][A-Za-z0-9_]*$` before interpolation.
-- Prefer parameterised `execute_statement(..., Parameters=[...])` for **values**.
-- Keep using stored procedures for the heavy DML (already the pattern).
+> The bookmark "schema" *is* `jobBookmarkKeys` + `jobBookmarkKeysSortOrder`. Pick a
+> column that only ever increases (identity/sequence or an append-only timestamp). A
+> composite key is allowed but every component must preserve monotonic order.
 
-### 8.8 Data quality gates (partially present)
+### 9.4 When bookmarks fail (failure modes)
 
-`stored_procedures/07_data_quality.sql` and the commented `check_datatype_matching`
-show intent. Recommended additions: row-count drift vs prior load, null-rate checks
-on keys, duplicate-key detection **before** MERGE, and — if you adopt Glue
-visual/Spark DQ — **Glue Data Quality (DQDL)** rulesets that fail the job on
-violation and emit results to CloudWatch.
+| # | Failure mode | Why it happens | Mitigation |
+|---|--------------|----------------|------------|
+| 1 | **No tracking at all** | Source read with `spark.read` (not a Glue reader) — *this repo's case* | Read via `create_dynamic_frame…`/`create_data_frame.from_catalog` with `transformation_ctx` |
+| 2 | **Everything reprocessed** | `transformation_ctx` missing, or **changes between runs** (e.g. embeds `run_id`/timestamp) | Use a **stable, unique** ctx per source (e.g. `f"read_{target_table}"`) |
+| 3 | **Same data reprocessed each run** | `job.commit()` not called, or job failed before commit | Always `job.commit()`; commit only after successful writes |
+| 4 | **Late/out-of-order files skipped (S3)** | A file lands with a modified time **older** than the last bookmark high-water mark | Don't backdate uploads; for late data, reset/pause or use a manifest |
+| 5 | **File reprocessed unexpectedly (S3)** | Same key **re-uploaded/overwritten** → new modified time | Treat S3 input as immutable; write new keys, never overwrite |
+| 6 | **Missed rows / duplicates (JDBC)** | Bookmark key not truly unique/monotonic, or has gaps/out-of-order inserts | Use a strict sequence/identity column; never a mutable column |
+| 7 | **Updates never captured (JDBC)** | Bookmarks see only **new** rows by increasing key — they are not CDC | Use a CDC tool (DMS/Debezium) or full-snapshot + MERGE for updates |
+| 8 | **State corruption under concurrency** | Multiple concurrent runs of the same job contend on bookmark state | Set **max concurrency = 1** for bookmark-enabled jobs (this repo already serialises) |
+| 9 | **Stale/incorrect state after code change** | Changing `transformation_ctx`, partitioning, or keys orphans old state | **Reset** the bookmark (`--job-bookmark-option job-bookmark-reset` or `reset-job-bookmark`) |
+| 10 | **Left in `pause`** | `job-bookmark-pause` reprocesses without advancing — easy to forget | Use `pause` only for deliberate replays; return to `enable` |
+| 11 | **Bounded run cut data short** | `boundedSize`/`boundedFiles` limits per run; remaining files wait | Expected with bounded execution; ensure the job re-runs to drain the backlog |
 
-### 8.9 Structured logging & audit (implemented — strong)
+### 9.5 Bookmarks + schema evolution
 
-`LogBuffer` emits JSON to CloudWatch **and** exports the full buffer to
-`s3://…/logs/YYYY/MM/DD/`, correlated by `run_id`; `job_sts` records counts and
-status per run. Keep `run_id` on every log line and in the audit row so a failure
-is traceable across CloudWatch, S3 logs, and Redshift.
+A bookmark is path/timestamp- or key-based, so **adding a column to the source does not
+break the bookmark itself**. But the *downstream transform* can break if it assumes the
+old schema — which is exactly where DynamicFrame `resolveChoice` / `apply_mapping`
+(§6) help: new/ambiguous columns are absorbed as `choice` rather than throwing. For
+JDBC, **do not** put an evolving/renamed column in `jobBookmarkKeys`; keep the key a
+stable surrogate.
 
-### 8.10 Spark hygiene
+### 9.6 Bookmark best practices
 
-- Avoid `df.collect()` / `df.toPandas()` on full datasets (driver OOM). The single
-  aggregation `collect()` in `alter_varchar_columns` is fine — it returns one row.
-- Cache only when reused; the job mostly streams once, so caching is unneeded.
-- Watch for **small-file** and **skew** problems on larger inputs; tune
-  `spark.sql.shuffle.partitions` and partition keys rather than always `coalesce(1)`.
-
-### 8.11 Resilience: retries, failure routing (implemented)
-
-`@retry_on_exception` wraps Redshift Data API calls with exponential backoff (5→120s,
-3 attempts). On failure the source file is moved to `data/unprocessed/YYYY/MM/`, the
-audit row is marked `FAILED`, logs are flushed, and the exception re-raises so Step
-Functions sees it. The data-model job additionally wraps star-schema processing in
-try/except so **base ETL success is preserved** even if dimensional load fails — a
-good blast-radius boundary.
-
-### 8.12 Worker sizing, timeouts, cost
-
-Pick the smallest worker type that fits (`G.1X`/`G.2X`), enable **auto-scaling**,
-and set a **job timeout** so a hung run can't burn DPU-hours. These files are small,
-so a low `NumberOfWorkers` is appropriate — see `docs/operations/cost_estimation.md`.
-
-### 8.13 Secrets & connectivity (implemented)
-
-Redshift credentials come from **Secrets Manager** via `secret_arn`; the **Redshift
-Data API** is used (HTTP, no VPC/driver/pooling) — simpler than JDBC for batch and a
-deliberate design choice (see the "Data API vs JDBC" note in
-`data_pipeline_logic.md`).
-
-### 8.14 Glue version selection
-
-Target **Glue 5.0** (Spark 3.5.4 / Python 3.11) for the performance and cost wins
-and `requirements.txt` dependency management documented in `glue_features.md`,
-unless a library pins you to an older runtime.
+- One **stable, unique** `transformation_ctx` per logical source; never embed run-specific values.
+- `job.commit()` **once**, at the very end, after successful writes.
+- Bookmark-enabled jobs → **max concurrency 1** (already true here via FIFO + serial Step Functions).
+- Treat S3 inputs as **immutable**; never overwrite a processed key.
+- JDBC keys: strictly increasing, unique, immutable.
+- Keep a documented **reset** runbook for re-platforming/backfills.
 
 ---
 
-## 9. Design considerations & trade-offs
+## 10. Other important scenarios and best practices
+
+Grounded in what the jobs already do well, plus gaps worth closing.
+
+### 10.1 Idempotency & exactly-once (implemented)
+Delete-then-insert MERGE on upsert keys (`sp_merge_from_staging`,
+`stored_procedures/02_merge_upsert.sql`) + SQS FIFO + Lambda reserved concurrency 1 +
+Step Functions `MaxConcurrency: 1`. Re-running a file yields the same result. Keep
+upsert keys genuinely unique.
+
+### 10.2 Staging + COPY + MERGE (implemented)
+Never `INSERT` row-by-row into Redshift. Write once, `COPY` into staging, MERGE. `COPY`
+is massively parallel; the staging hop makes the upsert atomic.
+
+### 10.3 `coalesce(1)` before COPY (implemented — know the trade-off)
+Forces a single output file so `COPY` reads a consistent object. **Cost:** funnels the
+final write through one task — fine for report-sized files; for multi-GB outputs prefer
+multiple files (`COPY` parallelises) or a manifest.
+
+### 10.4 CSV read robustness (gap worth closing)
+`inferSchema=true` reads the file **twice**; pass an explicit schema (you already build
+one from Redshift) for large inputs. With the DynamicFrame reader, set `format_options`
+for real-world CSVs: `quoteChar`, `escaper`, `multiline`, `withHeader`, and a
+corrupt-record column to capture malformed rows instead of failing.
+
+### 10.5 Run-isolated staging paths (implemented)
+Staging S3 prefixes and staging tables are keyed by `run_id`/UUID, so concurrent or
+retried runs never clobber each other.
+
+### 10.6 Job bookmarks for incremental ingest
+See §9. Only relevant if you batch-read folders; the event-driven design already
+processes each file once.
+
+### 10.7 SQL string-building / injection hardening (gap — important)
+DDL/DML is assembled with f-strings from config and column names (e.g.
+`ALTER TABLE … ADD COLUMN {col} {rtype}`). The audit writer escapes quotes, but
+identifiers are not validated. Since `target_table`/`upsert_keys`/column names flow from
+`config.json` and file headers, **validate identifiers** (`^[A-Za-z_][A-Za-z0-9_]*$`)
+before interpolation and prefer parameterised `Parameters=[…]` for **values**.
+
+### 10.8 Data quality gates (partially present)
+`stored_procedures/07_data_quality.sql` + the commented `check_datatype_matching` show
+intent. Add row-count drift, null-rate checks on keys, duplicate-key detection **before**
+MERGE, and ideally **Glue Data Quality** (DQDL) rulesets that fail the job and emit
+results.
+
+### 10.9 Structured logging & audit (implemented — strong)
+`LogBuffer` emits JSON to CloudWatch and exports to `s3://…/logs/YYYY/MM/DD/`, correlated
+by `run_id`; `job_sts` records counts/status. Keep `run_id` on every line and in the
+audit row.
+
+### 10.10 Spark hygiene
+Avoid `df.collect()`/`toPandas()` on full datasets (driver OOM). The single-row
+aggregate `collect()` in `alter_varchar_columns` is fine. Cache only on reuse. On larger
+inputs, watch small files/skew; tune `spark.sql.shuffle.partitions` and use
+`groupFiles`/`groupSize` (DynamicFrame readers) rather than always `coalesce(1)`.
+
+### 10.11 Resilience: retries & failure routing (implemented)
+`@retry_on_exception` (exp backoff) wraps Data API calls; on failure the source moves to
+`data/unprocessed/…`, audit is marked `FAILED`, logs flush, and the exception re-raises
+so Step Functions sees it. The data-model job wraps star-schema processing in try/except
+so **base ETL success is preserved** if dimensional load fails.
+
+### 10.12 Partitioning & pushdown (for catalog/large sources)
+For Data-Catalog sources, use `push_down_predicate` / `catalogPartitionPredicate` to
+prune partitions before read, and `partitionKeys` on write. Not needed for the current
+single-file CSVs but essential if inputs grow.
+
+### 10.13 Worker sizing, timeouts, cost
+Smallest worker that fits (`G.1X`/`G.2X`), enable **auto-scaling**, set a **job timeout**.
+These files are small → low `NumberOfWorkers`. See `docs/operations/cost_estimation.md`.
+
+### 10.14 Secrets & connectivity (implemented)
+Credentials via **Secrets Manager** (`secret_arn`); the **Redshift Data API** (HTTP, no
+VPC/driver/pool). Moving to the DynamicFrame Redshift connector trades this simplicity
+for a JDBC Glue Connection + VPC route (§8.5).
+
+### 10.15 Glue version
+Target **Glue 5.0** (Spark 3.5.4 / Python 3.11) for the performance/cost wins and
+`requirements.txt` support in `glue_features.md`, unless a library pins you older.
+
+---
+
+## 11. Design considerations and trade-offs
 
 | Decision in this repo | Benefit | Trade-off / when to revisit |
 |-----------------------|---------|------------------------------|
-| `DataFrame` + Redshift-anchored reconciliation | Precise DDL, typed warehouse, simple mental model | More bespoke code than DynamicFrame auto-resolution; less tolerant of truly chaotic input |
-| Target table = schema authority | Stable downstream contracts, views safe | Source-driven additions need a write to Redshift each drift |
+| `DataFrame` + Redshift-anchored reconciliation | Precise DDL, typed warehouse, simple model | More bespoke code than DynamicFrame auto-resolution; less tolerant of chaotic input |
+| Target table = schema authority | Stable downstream contracts | Source additions need a Redshift write per drift |
 | Additive-only evolution | No accidental data loss | Renames/drops/narrowing need manual migration |
-| `DECIMAL(38,18)` for non-key doubles | No float drift on money | Slightly larger storage; uniform precision may over-provision |
-| `COPY` + staging + delete/insert MERGE | Fast, atomic, idempotent | `COPY` is positional → column alignment is mandatory |
-| Redshift Data API | No VPC/driver, easy retries | Async polling; not ideal for high-frequency tiny writes |
-| Serial execution (FIFO + concurrency 1) | No merge conflicts | Lower throughput; parallelise per-table if needed |
-| DynamicFrames **not** used | Less abstraction, faster, predictable | Lose per-record error capture & `choice` resolution — adopt at the ingest edge (§7) if inputs get messy |
+| `DECIMAL(38,18)` for non-key doubles | No float drift on money | Larger storage; uniform precision may over-provision |
+| `COPY` + staging + delete/insert MERGE | Fast, atomic, idempotent | `COPY` is positional → column alignment mandatory |
+| Redshift Data API | No VPC/driver, easy retries | Async polling; not for high-frequency tiny writes |
+| Serial execution (FIFO + concurrency 1) | No merge conflicts; safe for bookmarks | Lower throughput; parallelise per-table if needed |
+| `spark.read` (not DynamicFrame reader) | Simple, fast, predictable | **No bookmarks**, no per-record error capture, no `choice` resolution (§9.1) |
+| DynamicFrames not used | Less abstraction, faster | Adopt at the ingest edge (§7.2) if inputs get messy or you need bookmarks |
 
 ---
 
-## 10. Quick reference
+## 12. Quick reference
 
-### Function → responsibility map (both jobs)
+### Complete module inventory (both jobs)
 
-| Function | Schema-evolution role |
-|----------|------------------------|
-| `read_csv_file` | Read CSV, normalise names, cast (double→decimal), add audit cols |
-| `read_redshift_table_schema` | Probe target schema via `SELECT … WHERE 1=0` → typed empty DF |
-| `check_table_exists` | Decide create-vs-evolve path |
-| `create_new_redshift_table` | DDL from Spark schema; `NOT NULL` on keys; create view |
-| `alter_redshift_table` | `ADD COLUMN` for new source columns (drop/recreate view) |
-| `fill_missing_columns` | Back-fill target columns absent from source |
-| `alter_varchar_columns` | Widen `VARCHAR`; promote `SMALLINT→INT→BIGINT` |
-| `check_datatype_matching` | (Optional) reject lossy text→number loads |
-| `df.select(target order)` | Positional alignment before `COPY` |
-| `create_staging_table` / `copy_to_redshift` / `run_merge` | Staging → COPY → idempotent MERGE |
-| `process_*_dimension` / `process_fact_from_config` | SCD1/SCD2 + fact loads (data-model job) |
+| Group | Functions |
+|-------|-----------|
+| Init / logging / resilience | `initialize_glue`, `LogBuffer.*`, `retry_on_exception` |
+| Read & normalise | `read_csv_file`, `_clean_colname` (+ inner `cast_like`) |
+| Redshift Data API | `_poll_statement`, `execute_sql` |
+| Schema discovery | `read_redshift_table_schema` (+ `map_dtype`), `check_table_exists`, `_spark_to_redshift_type`, `get_metadata` |
+| Schema evolution | `create_new_redshift_table`, `alter_redshift_table`, `alter_varchar_columns`, `get_default_value`, `fill_missing_columns` |
+| Load (stage/COPY/merge) | `create_staging_table`, `_find_single_csv_in_prefix`, `copy_to_redshift`, `run_merge`, `get_row_count` |
+| Views | `_load_view_config`, `create_views`, `drop_views` |
+| Data quality | `check_datatype_matching` *(simple job only)* |
+| Audit & S3 lifecycle | `update_job_sts_table`, `move_s3_file_to_archive`, `delete_staging_s3_files`, `move_s3_file_to_unprocessed` |
+| Dimensional *(data-model job only)* | `load_dimensional_config`, `process_dimension_from_config` (SCD2), `process_scd_type1_dimension` (SCD1), `process_fact_from_config` |
+| Entry | `main` |
+
+Detailed "today vs DynamicFrame" notes for each: see §7.
 
 ### Glossary
 
-- **`choice` type** — a DynamicFrame column whose type varies across records;
-  resolved with `resolveChoice`.
-- **Target-anchored evolution** — the destination schema, not the file, defines the
-  contract; the file is conformed to it.
-- **Additive evolution** — only add columns / widen types; never drop or narrow
-  automatically.
-- **Positional COPY** — Redshift `COPY` maps CSV columns by order, so DataFrame
-  column order must match the table.
+- **`choice` type** — a DynamicFrame column whose type varies across records; resolved with `resolveChoice`.
+- **Target-anchored evolution** — the destination schema, not the file, is the contract.
+- **Additive evolution** — only add columns / widen types; never drop or narrow automatically.
+- **Positional COPY** — Redshift `COPY` maps CSV columns by order; DataFrame column order must match the table.
+- **Bookmark key** — the unique, monotonically increasing column(s) (`jobBookmarkKeys`) that define a JDBC bookmark's high-water mark.
+- **`transformation_ctx`** — the identifier that ties a source/sink to its bookmark state; must be stable and unique.
 
 ### See also
 
@@ -899,4 +770,4 @@ unless a library pins you to an older runtime.
 - [`scenario_based_questions.md`](../../scenario_based_questions/scenario_based_questions.md) — schema-evolution & bookmark scenarios
 - [`glue_features.md`](../../glue_features/glue_features.md) — Glue 5.0 / table formats / FGAC
 - [`docs/operations/cost_estimation.md`](../operations/cost_estimation.md) — worker sizing & cost
-- AWS docs: *Glue DynamicFrame class*, *ResolveChoice transform*, *Updating the Data Catalog from a job*, *Glue job bookmarks*, *Redshift Data API*
+- AWS docs: *Glue DynamicFrame class*, *ResolveChoice transform*, *Updating the Data Catalog from a job*, *Tracking processed data with job bookmarks*, *Redshift Data API*
