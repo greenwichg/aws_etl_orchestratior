@@ -1,42 +1,52 @@
 """
-DynamicFrame variant of the ETL Glue job (REFERENCE IMPLEMENTATION).
+DynamicFrame variant of the SIMPLE ETL Glue job (REFERENCE IMPLEMENTATION).
 
-This is a standalone, runnable reference that implements the design in
-`docs/pipeline/glue_schema_evolution_and_dynamicframes.md` (Section 8) using AWS Glue
-DynamicFrames instead of plain Spark DataFrames.
+This is a standalone, runnable reference that re-implements the production simple job
+  glue_jobs/without_data_model/glue_job.py
+using AWS Glue DynamicFrames, per the design in
+  docs/pipeline/glue_schema_evolution_and_dynamicframes.md  (Sections 4, 7, 8, 9).
 
-It is NOT a replacement for the production scripts and does not modify them:
-  - glue_jobs/without_data_model/glue_job.py        (production, untouched)
-  - glue_jobs/with_data_model/glue_job_with_data_model.py (production, untouched)
+It is FULL PARITY with the simple (without_data_model) job — same schema-evolution
+behaviour, same view handling, same staging/merge via stored procedures, same audit /
+archive / failure routing — but built on DynamicFrames. It does NOT implement the star
+schema (that lives in glue_jobs/with_data_model/...). The production scripts are NOT
+modified by this file.
 
-What differs from the production DataFrame jobs
------------------------------------------------
-  1. Source is read with `create_dynamic_frame.from_options(... transformation_ctx=...)`,
-     so Glue JOB BOOKMARKS actually track processed data (the production jobs use
-     `spark.read.csv`, which does not participate in bookmarks — see doc Section 9).
-  2. Type ambiguity is resolved with `resolveChoice`; precise typing reuses the same
-     `cast_like` rule as production (non-key double -> DECIMAL(38,18)).
-  3. The load path collapses `coalesce(1).write` + create-staging + COPY + merge into a
-     SINGLE `write_dynamic_frame` call to the Redshift connector, carrying:
-        - preactions : ALTER/CREATE staging+target (schema evolution lives here)
-        - postactions: CALL public.sp_merge_from_staging(...)  (reuses the existing SP)
+What differs from the production DataFrame job
+----------------------------------------------
+  1. Source is read with `create_dynamic_frame.from_options(... transformation_ctx=...)`
+     so Glue JOB BOOKMARKS actually track processed data (production uses
+     `spark.read.csv`, which does NOT participate in bookmarks — see doc Section 9).
+  2. Type ambiguity is resolved with `resolveChoice`; malformed records are captured via
+     `errorsAsDynamicFrame()` and quarantined instead of failing the whole job.
+  3. The S3-write + COPY are handled by ONE `write_dynamic_frame` call to the Redshift
+     connector; staging creation and the upsert reuse the EXISTING stored procedures
+     (`sp_create_staging_table` as a preaction, `sp_merge_from_staging` as a postaction).
+
+What is the SAME as production (ported faithfully)
+--------------------------------------------------
+  * Schema discovery via the Redshift Data API (SELECT ... WHERE 1=0).
+  * Additive schema evolution: ADD COLUMN for new source columns, back-fill target-only
+    columns, widen VARCHAR, and promote SMALLINT -> INTEGER -> BIGINT — each wrapped in
+    view drop/recreate because Redshift views bind to their table.
+  * Reporting view create/drop driven by config/config_view.json.
+  * Audit logging (sp_log_job_status), archive on success, move-to-unprocessed on
+    failure, structured JSON logs to CloudWatch + S3.
+
+NOTE on a production bug this variant fixes
+-------------------------------------------
+  Production `alter_redshift_table` compares the Redshift schema against itself (it reads
+  `source_df` from Redshift rather than using the incoming CSV), so genuinely new source
+  columns are never added. This variant compares the SOURCE frame against the target and
+  adds the missing columns, which is the clearly-intended behaviour.
 
 Prerequisites (vs the Data API used by production)
 --------------------------------------------------
-  * A Glue Connection to Redshift (JDBC) named via --connection_name, with the job
-    placed in a VPC/subnet that can reach the Redshift endpoint. (The production jobs
-    use the Redshift Data API, which needs no VPC — this is the trade-off documented
-    in Section 8.5 / 10.14.)
-  * A writable S3 temp location passed via --redshift_tmp_dir (the connector stages
-    data there before COPY).
+  * A Glue Connection (JDBC) to Redshift, named via --connection_name, with the job in a
+    VPC/subnet that can reach Redshift. (Production uses only the Data API — no VPC. This
+    is the documented trade-off, doc Section 8.5 / 10.14.)
+  * A writable S3 temp dir via --redshift_tmp_dir (the connector stages data there).
   * Job parameter `--job-bookmark-option job-bookmark-enable` to activate bookmarks.
-
-Schema evolution scope (matches production semantics, Section 4):
-  * additive only — new source columns -> ADD COLUMN; target-only columns -> back-filled;
-    VARCHAR columns widened to fit. Integer promotion and view drop/recreate can be
-    ported from the production `alter_varchar_columns` / `drop_views` the same way
-    (emitted as additional preactions) — see the inline note in
-    reconcile_and_build_preactions().
 """
 
 import sys
@@ -56,11 +66,12 @@ from awsglue.job import Job
 from awsglue.dynamicframe import DynamicFrame
 from pyspark.context import SparkContext
 from pyspark.sql import functions as F
-from pyspark.sql.functions import lit
+from pyspark.sql.functions import lit, count
 from pyspark.sql.types import (
     StructType, StructField, StringType,
     IntegerType, FloatType, DoubleType, LongType, DecimalType,
-    BooleanType, TimestampType, DateType, BinaryType
+    BooleanType, TimestampType, DateType, BinaryType,
+    ShortType, ByteType, ArrayType, MapType
 )
 
 # ===============================================================
@@ -225,8 +236,70 @@ def _spark_to_redshift_type(data_type) -> str:
     return "VARCHAR(256)"
 
 # ===============================================================
-# REDSHIFT DATA API  — still used for schema discovery + audit
-# (DDL/SP introspection that the connector does not perform)
+# DYNAMICFRAME INGEST + CONFORM + QUALITY  (variant-specific)
+# ===============================================================
+
+
+def read_source(config: dict, glue_context, log):
+    """Section 7.2 / 8: ingest via the Glue reader so BOOKMARKS track this source.
+
+    Replaces production `read_csv_file`'s `spark.read.csv` (which does not participate in
+    job bookmarks). `transformation_ctx` is stable + unique => it is the bookmark key.
+    """
+    source = f"s3://{config['src_bucket']}/data/in/{config['source_file_name']}"
+    log.info("Reading source as DynamicFrame", path=source)
+    return glue_context.create_dynamic_frame.from_options(
+        connection_type="s3",
+        connection_options={"paths": [source]},
+        format="csv",
+        # Section 10.4 — real-world CSV robustness
+        format_options={"withHeader": True, "quoteChar": '"', "escaper": '"'},
+        transformation_ctx=f"read_{config['target_table']}",
+    )
+
+
+def quality_gate(dyf, config: dict, glue_context, log):
+    """Section 7.6: capture malformed records instead of failing the whole job.
+
+    Must run on the raw DynamicFrame (where ChoiceType / error records still exist),
+    before `toDF()` in `conform_to_df`.
+    """
+    err_count = dyf.errorsCount()
+    if err_count:
+        log.warning("DynamicFrame contained malformed records", errors=err_count)
+        bad = dyf.errorsAsDynamicFrame()
+        glue_context.write_dynamic_frame.from_options(
+            frame=bad, connection_type="s3",
+            connection_options={
+                "path": f"s3://{config['src_bucket']}/data/quarantine/{config['target_table']}/"},
+            format="json", transformation_ctx="quarantine")
+        threshold = config.get("error_threshold", 0)
+        if err_count > threshold:
+            raise RuntimeError(f"{err_count} malformed records exceeded threshold {threshold}")
+    return dyf
+
+
+def conform_to_df(dyf, config: dict, log):
+    """Section 8.1: resolve type ambiguity, normalise names, retype, add audit cols.
+
+    Returns a Spark DataFrame so the schema-reconciliation steps below can reuse the
+    production logic verbatim. `resolveChoice(choice="cast:string")` only touches
+    ambiguous (ChoiceType) columns; cleanly-inferred columns keep their type.
+    """
+    dyf = dyf.resolveChoice(choice="cast:string")
+    df = dyf.toDF()
+    for old in df.columns:
+        new = _clean_colname(old)
+        if old != new:
+            df = df.withColumnRenamed(old, new)
+    df = cast_like(df, config)
+    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    df = (df.withColumn("run_date", lit(run_ts).cast(TimestampType()))
+            .withColumn("file_name", lit(config['source_file_name'])))
+    return df
+
+# ===============================================================
+# REDSHIFT DATA API UTILITIES  — identical to production
 # ===============================================================
 
 
@@ -249,6 +322,10 @@ def execute_sql(sql: str, redshift_conn: dict, client):
         Sql=sql,
         SecretArn=redshift_conn['secret_arn'])
     return _poll_statement(client, resp["Id"], ctx="SQL")
+
+# ===============================================================
+# SCHEMA DISCOVERY & HARMONIZATION  — ported from production
+# ===============================================================
 
 
 def read_redshift_table_schema(config: dict, redshift_conn: dict, spark, client):
@@ -301,6 +378,54 @@ def check_table_exists(redshift_conn: dict, config: dict, client) -> bool:
     return bool(client.get_statement_result(Id=resp["Id"]).get("Records"))
 
 
+def create_new_redshift_table(config: dict, redshift_conn: dict, df, client, log):
+    log.info("Target table does not exist; creating")
+    upsert_keys = set(config.get('upsert_keys', []))
+    cols_ddls = []
+    for field in df.schema.fields:
+        if not _valid_ident(field.name):
+            raise ValueError(f"Unsafe column identifier rejected: {field.name!r}")
+        not_null = " NOT NULL" if field.name in upsert_keys else ""
+        cols_ddls.append(f"{field.name} {_spark_to_redshift_type(field.dataType)}{not_null}")
+    ddl = dedent(f"""
+        CREATE TABLE IF NOT EXISTS {redshift_conn['schema_name']}.{config['target_table']} (
+            {', '.join(cols_ddls)}
+        );
+    """)
+    if execute_sql(ddl, redshift_conn, client).get("Status") == "FINISHED":
+        log.info(f"'{config['target_table']}' table successfully created")
+        create_views(config, redshift_conn, client, log)
+
+
+@retry_on_exception(max_attempts=3, base_delay=5, max_delay=60, exceptions=(Exception,))
+def alter_redshift_table(config: dict, redshift_conn: dict, df, redshift_df, client, log):
+    """Add columns present in the SOURCE frame but missing from the target.
+
+    NOTE: production compares the Redshift schema against itself (a bug that silently
+    drops genuinely new source columns). This variant compares the source `df` against
+    the target `redshift_df`, which is the intended additive-evolution behaviour.
+    """
+    target_cols = [c.name for c in redshift_df.schema.fields]
+    missed_cols = [f.name for f in df.schema.fields if f.name not in target_cols]
+    if not missed_cols:
+        return
+    # views bind to the table — drop before ALTER, recreate after
+    drop_views(config, redshift_conn, client, log)
+    for colf in df.schema.fields:
+        if colf.name in target_cols:
+            continue
+        if not _valid_ident(colf.name):
+            raise ValueError(f"Unsafe column identifier rejected: {colf.name!r}")
+        rtype = _spark_to_redshift_type(colf.dataType)
+        sql = (f"ALTER TABLE {redshift_conn['schema_name']}.{config['target_table']} "
+               f"ADD COLUMN {colf.name} {rtype};")
+        execute_sql(sql, redshift_conn, client)
+    log.info(f"columns: {missed_cols} are added successfully")
+    desc = create_views(config, redshift_conn, client, log)
+    if desc and desc.get('Status') == 'FINISHED':
+        log.info("view is refreshed successfully")
+
+
 def get_metadata(config: dict, redshift_conn: dict, client) -> dict:
     sql = dedent(f"""
         SELECT column_name, data_type, character_maximum_length
@@ -319,29 +444,186 @@ def get_metadata(config: dict, redshift_conn: dict, client) -> dict:
     return meta
 
 
-def create_new_redshift_table(config: dict, redshift_conn: dict, df, client, log):
-    log.info("Target table does not exist; creating")
-    upsert_keys = set(config.get('upsert_keys', []))
-    cols_ddls = []
+@retry_on_exception(max_attempts=3, base_delay=5, max_delay=120, exceptions=(Exception,))
+def alter_varchar_columns(config: dict, redshift_conn: dict, df, client, log):
+    """Widen VARCHAR to fit, and promote SMALLINT -> INTEGER -> BIGINT. Ported verbatim
+    from production (with view drop/recreate around each change)."""
+    metadata = get_metadata(config, redshift_conn, client)
+    INT_RANGES = {
+        "smallint": 32767, "int2": 32767,
+        "integer": 2147483647, "int": 2147483647, "int4": 2147483647,
+        "bigint": 9223372036854775807, "int8": 9223372036854775807,
+    }
+
+    string_cols, int_cols = [], []
+    for f in df.schema.fields:
+        if isinstance(f.dataType, StringType):
+            string_cols.append(f.name)
+        elif isinstance(f.dataType, (IntegerType, LongType, ShortType)):
+            int_cols.append(f.name)
+
+    if not string_cols and not int_cols:
+        return
+
+    agg_expr = [F.max(F.length(F.col(c))).alias(c) for c in string_cols]
+    agg_expr += [F.max(F.abs(F.col(c))).alias(c) for c in int_cols]
+    row = df.agg(*agg_expr).collect()[0]
+
+    # ---- VARCHAR widening ----
+    str_altered_cols = []
+    for colname in string_cols:
+        src_len = int(row[colname] or 0)
+        curr_len = int(metadata.get(colname, {}).get("length") or 0)
+        if src_len > curr_len:
+            drop_views(config, redshift_conn, client, log)
+            new_len = min(src_len + 10, 65535)
+            sql = (f"ALTER TABLE {redshift_conn['schema_name']}.{config['target_table']} "
+                   f"ALTER COLUMN {colname} TYPE VARCHAR({new_len});")
+            execute_sql(sql, redshift_conn, client)
+            str_altered_cols.append({"column_name": colname, "source_length": src_len,
+                                     "current_length": curr_len, "new_length": new_len})
+    if str_altered_cols:
+        log.info(f"columns: {str_altered_cols} are altered with new length")
+        desc = create_views(config, redshift_conn, client, log)
+        if desc and desc.get('Status') == 'FINISHED':
+            log.info("view is refreshed successfully")
+
+    # ---- INTEGER widening (add -> update -> drop -> rename) ----
+    int_altered_cols = []
+    for colname in int_cols:
+        max_val = int(row[colname] or 0)
+        curr_dtype = metadata.get(colname, {}).get("dtype")
+        if not curr_dtype or curr_dtype not in INT_RANGES:
+            continue
+        if max_val > INT_RANGES[curr_dtype]:
+            if curr_dtype in ("smallint", "int2"):
+                new_type = "INTEGER"
+            elif curr_dtype in ("integer", "int", "int4"):
+                new_type = "BIGINT"
+            else:
+                continue  # already BIGINT
+            drop_views(config, redshift_conn, client, log)
+            schema, tbl = redshift_conn['schema_name'], config['target_table']
+            add_sql = f"ALTER TABLE {schema}.{tbl} ADD COLUMN sample_col {new_type};"
+            set_sql = f"UPDATE {schema}.{tbl} SET sample_col = {colname}::{new_type};"
+            drop_sql = f"ALTER TABLE {schema}.{tbl} DROP COLUMN {colname};"
+            rename_sql = f"ALTER TABLE {schema}.{tbl} RENAME COLUMN sample_col TO {colname};"
+            desc = execute_sql(add_sql, redshift_conn, client)
+            if desc['Status'] == 'FINISHED':
+                desc = execute_sql(set_sql, redshift_conn, client)
+                if desc['Status'] == 'FINISHED':
+                    desc = execute_sql(drop_sql, redshift_conn, client)
+                    if desc['Status'] == 'FINISHED':
+                        execute_sql(rename_sql, redshift_conn, client)
+            int_altered_cols.append({"column_name": colname, "current_datatype": curr_dtype,
+                                     "new_datatype": new_type})
+    if int_altered_cols:
+        log.info(f"columns: {int_altered_cols} are altered with new datatype")
+        desc = create_views(config, redshift_conn, client, log)
+        if desc and desc.get('Status') == 'FINISHED':
+            log.info("view is refreshed successfully")
+
+
+def fill_missing_columns(df, redshift_df, log):
+    """Back-fill columns the target has but the source lacks (keeps COPY aligned)."""
+    src_cols = set(df.columns)
+    missed_cols = []
+    for colf in redshift_df.schema.fields:
+        if colf.name not in src_cols:
+            missed_cols.append(colf.name)
+            df = df.withColumn(colf.name, lit(get_default_value(colf.dataType)))
+    if missed_cols:
+        log.info(f"columns: {missed_cols} filled with null values")
+    return df
+
+
+def check_datatype_matching(redshift_df, df, log):
+    """Reject lossy non-numeric -> numeric loads. Parity with production (call site is
+    commented out below, matching production)."""
+    log.info("checking for datatype mismatch between source file and redshift table")
+    redshift_cols = {field.name: field.dataType for field in redshift_df.schema.fields}
+    non_numeric_types = (StringType, BooleanType, BinaryType, DateType, TimestampType,
+                         ArrayType, MapType, StructType)
+    numeric_types = (ByteType, ShortType, IntegerType, LongType, FloatType, DoubleType, DecimalType)
     for field in df.schema.fields:
-        not_null = " NOT NULL" if field.name in upsert_keys else ""
-        cols_ddls.append(f"{field.name} {_spark_to_redshift_type(field.dataType)}{not_null}")
-    ddl = dedent(f"""
-        CREATE TABLE IF NOT EXISTS {redshift_conn['schema_name']}.{config['target_table']} (
-            {', '.join(cols_ddls)}
-        );
-    """)
-    if execute_sql(ddl, redshift_conn, client).get("Status") == "FINISHED":
-        log.info(f"'{config['target_table']}' table created")
+        if field.name in redshift_cols:
+            src_type = type(field.dataType)
+            tgt_type = type(redshift_cols[field.name])
+            non_null_count = df.select(count(field.name)).collect()[0][0]
+            if issubclass(src_type, non_numeric_types) and issubclass(tgt_type, numeric_types) and non_null_count != 0:
+                raise Exception(
+                    f"Datatype mismatch for column '{field.name}': "
+                    f"source={src_type.__name__}, target={tgt_type.__name__}")
+
+# ===============================================================
+# VIEW CONFIG + CREATE/DROP  — ported from production
+# ===============================================================
+
+
+def _load_view_config(config: dict, log):
+    bucket = config['src_bucket']
+    if not bucket:
+        log.error("source bucket is not defined")
+        raise ValueError("source bucket not found")
+    s3 = boto3.client('s3')
+    try:
+        response = s3.get_object(Bucket=bucket, Key="config/config_view.json")
+        data = json.loads(response['Body'].read().decode('utf-8'))
+    except Exception as e:
+        log.error(f"Failed to download or parse config file from S3: {e}")
+        raise
+    v_config = None
+    for d in data:
+        if d['source_table'] == config['target_table']:
+            v_config = {
+                'source_table': d['source_table'], 'view_name': d['view_name'],
+                'schema_name': d['schema_name'], 'definition': d['definition']}
+    return v_config
+
+
+def create_views(config: dict, redshift_conn: dict, client, log):
+    v_config = _load_view_config(config, log)
+    if not v_config:
+        log.info("No configuration found for the target table")
+        return None
+    ddl = v_config['definition'].format(
+        schema_name=v_config['schema_name'], view_name=v_config['view_name'],
+        source_table=v_config['source_table'])
+    try:
+        resp = client.execute_statement(
+            WorkgroupName=redshift_conn['workgroup_name'], Database=redshift_conn['database'],
+            Sql=ddl, SecretArn=redshift_conn['secret_arn'])
+        return _poll_statement(client, resp["Id"], ctx="Create view")
+    except Exception as e:
+        log.error(f"Failed to create view '{v_config['view_name']}' with error: {e}")
+        raise
+
+
+def drop_views(config: dict, redshift_conn: dict, client, log):
+    v_config = _load_view_config(config, log)
+    if not v_config:
+        log.warning("No view configuration found for the target table — nothing to drop")
+        return None
+    ddl = f"DROP VIEW IF EXISTS {v_config['schema_name']}.{v_config['view_name']}"
+    try:
+        resp = client.execute_statement(
+            WorkgroupName=redshift_conn['workgroup_name'], Database=redshift_conn['database'],
+            Sql=ddl, SecretArn=redshift_conn['secret_arn'])
+        return _poll_statement(client, resp["Id"], ctx="Drop view")
+    except Exception as e:
+        log.error(f"Failed to drop view '{v_config['view_name']}' with error: {e}")
+        raise
+
+# ===============================================================
+# AUDIT + ROW COUNT  — ported from production
+# ===============================================================
 
 
 def get_row_count(config: dict, redshift_conn: dict, client) -> int:
     sql = f"SELECT COUNT(*) FROM {redshift_conn['schema_name']}.{config['target_table']};"
     resp = client.execute_statement(
-        WorkgroupName=redshift_conn['workgroup_name'],
-        Database=redshift_conn['database'],
-        Sql=sql,
-        SecretArn=redshift_conn['secret_arn'])
+        WorkgroupName=redshift_conn['workgroup_name'], Database=redshift_conn['database'],
+        Sql=sql, SecretArn=redshift_conn['secret_arn'])
     _poll_statement(client, resp["Id"], ctx="Row count")
     records = client.get_statement_result(Id=resp["Id"]).get("Records", [])
     if not records:
@@ -370,163 +652,78 @@ def update_job_sts_table(config, redshift_conn, run_start_ts, run_end_ts, source
     execute_sql(sql, redshift_conn, client)
 
 # ===============================================================
-# S3 ARCHIVE / CLEANUP  — ported from production
+# S3 HELPERS (archive & cleanup)  — ported from production
 # ===============================================================
 
 
-def _move_s3_file(config, target_file_path, log):
-    s3 = boto3.client('s3')
-    source = f"s3://{config['src_bucket']}/data/in/{config['source_file_name']}"
-    sbkt, skey = source.replace("s3://", "").split("/", 1)
-    tbkt, tkey = target_file_path.replace("s3://", "").split("/", 1)
+def move_s3_file_to_archive(config: dict, target_file_path: str, log):
+    s3_client = boto3.client('s3')
+    source_file_path = f"s3://{config['src_bucket']}/data/in/{config['source_file_name']}"
+    source_bucket, source_key = source_file_path.replace("s3://", "").split("/", 1)
+    target_bucket, target_key = target_file_path.replace("s3://", "").split("/", 1)
     try:
-        s3.copy_object(Bucket=tbkt, CopySource={'Bucket': sbkt, 'Key': skey}, Key=tkey)
-        s3.delete_object(Bucket=sbkt, Key=skey)
-        log.info(f"Moved {source} -> {target_file_path}")
+        s3_client.copy_object(Bucket=target_bucket,
+                              CopySource={'Bucket': source_bucket, 'Key': source_key},
+                              Key=target_key)
+        log.info(f"File copied from {source_file_path} to {target_file_path}")
+        s3_client.delete_object(Bucket=source_bucket, Key=source_key)
+        log.info(f"Original file {source_file_path} deleted.")
+    except Exception as e:
+        log.error("Error while moving file", error=str(e))
+
+
+def delete_staging_s3_files(s3_staging_path: str, log):
+    s3_client = boto3.client('s3')
+    bucket_name, prefix = s3_staging_path.replace("s3://", "").split("/", 1)
+    try:
+        objects = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+        for obj in objects.get("Contents", []):
+            s3_client.delete_object(Bucket=bucket_name, Key=obj["Key"])
+            log.info(f"Deleted staging file: {obj['Key']}")
+    except Exception as e:
+        log.error("Error deleting staging files", error=str(e))
+
+
+def move_s3_file_to_unprocessed(config: dict, target_file_path: str, log):
+    s3_client = boto3.client('s3')
+    source_file_path = f"s3://{config['src_bucket']}/data/in/{config['source_file_name']}"
+    source_bucket, source_key = source_file_path.replace("s3://", "").split("/", 1)
+    target_bucket, target_key = target_file_path.replace("s3://", "").split("/", 1)
+    try:
+        s3_client.copy_object(Bucket=target_bucket,
+                              CopySource={'Bucket': source_bucket, 'Key': source_key},
+                              Key=target_key)
+        log.info(f"File copied from {source_file_path} to {target_file_path}")
+        s3_client.delete_object(Bucket=source_bucket, Key=source_key)
+        log.info(f"Original file {source_file_path} deleted.")
     except Exception as e:
         log.error("Error while moving file", error=str(e))
 
 # ===============================================================
-# DYNAMICFRAME MODULES  (the variant-specific logic — doc Section 8)
+# LOAD + MERGE via the Redshift connector  (variant-specific)
 # ===============================================================
 
 
-def read_source(config: dict, glue_context, log):
-    """Section 7.2 / 8: ingest via the Glue reader so BOOKMARKS track this source."""
-    source = f"s3://{config['src_bucket']}/data/in/{config['source_file_name']}"
-    log.info("Reading source as DynamicFrame", path=source)
-    return glue_context.create_dynamic_frame.from_options(
-        connection_type="s3",
-        connection_options={"paths": [source]},
-        format="csv",
-        # Section 10.4 — real-world CSV robustness
-        format_options={"withHeader": True, "quoteChar": '"', "escaper": '"'},
-        transformation_ctx=f"read_{config['target_table']}",  # stable + unique => bookmark key
-    )
+@retry_on_exception(max_attempts=3, base_delay=5, max_delay=120, exceptions=(Exception,))
+def load_and_merge(aligned, config, redshift_conn, glue_context, log):
+    """Section 8: one connector write replaces production's
+    write(CSV) + sp_create_staging_table + sp_copy_from_s3 + sp_merge_from_staging.
 
-
-def conform(dyf, config: dict, glue_context, log):
-    """Section 8.1: resolve type ambiguity, normalise names, retype, add audit cols.
-
-    `resolveChoice(choice="cast:string")` only touches ambiguous (ChoiceType) columns;
-    cleanly-inferred columns keep their type. `cast_like` then applies the production
-    DECIMAL-for-money rule. (Pure-DynamicFrame alternative: `dyf.apply_mapping([...])`.)
-    """
-    dyf = dyf.resolveChoice(choice="cast:string")
-    df = dyf.toDF()
-    for old in df.columns:
-        new = _clean_colname(old)
-        if old != new:
-            df = df.withColumnRenamed(old, new)
-    df = cast_like(df, config)
-    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    df = (df.withColumn("run_date", lit(run_ts).cast(TimestampType()))
-            .withColumn("file_name", lit(config['source_file_name'])))
-    return DynamicFrame.fromDF(df, glue_context, "conformed")
-
-
-def quality_gate(dyf, config: dict, glue_context, log):
-    """Section 7.6: capture malformed records instead of failing the whole job."""
-    err_count = dyf.errorsCount()
-    if err_count:
-        log.warning("DynamicFrame contained malformed records", errors=err_count)
-        bad = dyf.errorsAsDynamicFrame()
-        glue_context.write_dynamic_frame.from_options(
-            frame=bad, connection_type="s3",
-            connection_options={
-                "path": f"s3://{config['src_bucket']}/data/quarantine/{config['target_table']}/"},
-            format="json", transformation_ctx="quarantine")
-        threshold = config.get("error_threshold", 0)
-        if err_count > threshold:
-            raise RuntimeError(f"{err_count} malformed records exceeded threshold {threshold}")
-    return dyf
-
-
-@retry_on_exception(max_attempts=3, base_delay=5, max_delay=60, exceptions=(Exception,))
-def reconcile_and_build_preactions(dyf, config, redshift_conn, spark, glue_context, client, log):
-    """Section 8.2: additive schema evolution expressed as connector preactions.
-
-    Returns (preactions_sql, aligned_dynamicframe, staging_table_name).
-      * new source columns      -> ALTER TABLE target ADD COLUMN  (preaction)
-      * VARCHAR too short        -> ALTER TABLE target ALTER COLUMN TYPE  (preaction)
-      * target-only columns      -> back-filled in the frame
-      * final frame aligned to the (now reconciled) target column order
-
-    NOTE: integer promotion (SMALLINT->INT->BIGINT) and view drop/recreate are omitted
-    here for clarity; port them from the production `alter_varchar_columns` / `drop_views`
-    as additional preactions if your tables need them.
+    Schema evolution has ALREADY run (via the Data API) before this call, so the staging
+    table created in preactions inherits the evolved target schema. The connector stages
+    `aligned` to redshiftTmpDir and COPYs into staging; postactions run the existing merge
+    SP, which also drops the staging table.
     """
     schema = redshift_conn['schema_name']
     target = config['target_table']
-    staging = f"{target}_stg"
-
-    df = dyf.toDF()
-    redshift_df = read_redshift_table_schema(config, redshift_conn, spark, client)
-    tgt_types = {f.name: f.dataType for f in redshift_df.schema.fields}
-    src_types = {f.name: f.dataType for f in df.schema.fields}
-
-    pre = []
-
-    # 1) New columns in the source -> ADD COLUMN on the target
-    new_cols = [n for n in src_types if n not in tgt_types]
-    for n in new_cols:
-        if not _valid_ident(n):
-            raise ValueError(f"Unsafe column identifier rejected: {n!r}")
-        pre.append(f"ALTER TABLE {schema}.{target} ADD COLUMN {n} {_spark_to_redshift_type(src_types[n])};")
-    if new_cols:
-        log.info("Schema evolution: adding columns", columns=new_cols)
-
-    # 2) VARCHAR widening (single-pass max length aggregate -> one driver row)
-    str_cols = [n for n, t in src_types.items() if isinstance(t, StringType) and n in tgt_types]
-    if str_cols:
-        meta = get_metadata(config, redshift_conn, client)
-        row = df.agg(*[F.max(F.length(F.col(c))).alias(c) for c in str_cols]).collect()[0]
-        widened = []
-        for c in str_cols:
-            src_len = int(row[c] or 0)
-            cur_len = int((meta.get(c) or {}).get("length") or 0)
-            if src_len > cur_len:
-                new_len = min(src_len + 10, 65535)
-                pre.append(f"ALTER TABLE {schema}.{target} ALTER COLUMN {c} TYPE VARCHAR({new_len});")
-                widened.append({"column": c, "from": cur_len, "to": new_len})
-        if widened:
-            log.info("Schema evolution: widening VARCHAR", columns=widened)
-
-    # 3) Back-fill target-only columns in the frame (keeps COPY column count aligned)
-    backfilled = []
-    for n, t in tgt_types.items():
-        if n not in src_types:
-            df = df.withColumn(n, F.lit(get_default_value(t)))
-            backfilled.append(n)
-    if backfilled:
-        log.info("Back-filled target-only columns", columns=backfilled)
-
-    # 4) Align to target column order (Redshift COPY is positional) — Section 4.5
-    df = df.select(*[f.name for f in redshift_df.schema.fields])
-
-    # 5) Staging lifecycle — created AFTER the target ALTERs so it inherits new columns
-    pre.append(f"DROP TABLE IF EXISTS {schema}.{staging};")
-    pre.append(f"CREATE TABLE {schema}.{staging} (LIKE {schema}.{target});")
-
-    aligned = DynamicFrame.fromDF(df, glue_context, "aligned")
-    return ("\n".join(pre), aligned, staging)
-
-
-def load_and_merge(aligned, preactions, staging, config, redshift_conn, glue_context, log):
-    """Section 8.2: one connector write replaces write+COPY+stage+merge.
-
-    The connector stages `aligned` into `redshiftTmpDir`, runs `preactions`, COPYs into
-    the staging table, then runs `postactions` (which reuse the existing merge SP and
-    drop the staging table).
-    """
-    schema = redshift_conn['schema_name']
-    target = config['target_table']
+    staging = f"{target}_stg_{uuid.uuid4().hex[:8]}"
     keys_csv = ",".join(config['upsert_keys'])
-    postactions = (
-        f"CALL public.sp_merge_from_staging("
-        f"'{schema}', '{target}', '{staging}', '{keys_csv}')")
 
-    log.info("Loading via Redshift connector", staging=staging, postaction="sp_merge_from_staging")
+    preactions = f"CALL public.sp_create_staging_table('{schema}', '{staging}', '{target}')"
+    postactions = (f"CALL public.sp_merge_from_staging("
+                   f"'{schema}', '{target}', '{staging}', '{keys_csv}')")
+
+    log.info("Loading via Redshift connector", staging=staging)
     glue_context.write_dynamic_frame.from_options(
         frame=aligned,
         connection_type="redshift",
@@ -537,7 +734,7 @@ def load_and_merge(aligned, preactions, staging, config, redshift_conn, glue_con
             "dbtable": f"{schema}.{staging}",
             "preactions": preactions,
             "postactions": postactions,
-            "aws_iam_role": redshift_conn["iam_role"],  # used by the COPY under the hood
+            "aws_iam_role": redshift_conn["iam_role"],
         },
         transformation_ctx=f"load_{target}",
     )
@@ -591,30 +788,46 @@ def main():
     log_base_name = f"{stem}_log_{now.strftime('%Y%m%d%H%M%S')}.txt"
     s3_archive_path = f"s3://{config['src_bucket']}/data/archive/{year}/{month}/{stem}_{now.strftime('%Y%m%d%H%M%S')}.csv"
     s3_unprocessed_path = f"s3://{config['src_bucket']}/data/unprocessed/{year}/{month}/{source_filename}"
+    quarantine_prefix = f"s3://{config['src_bucket']}/data/quarantine/{config['target_table']}/"
 
     records_read = 0
     try:
-        # --- Ingest (bookmarked) -> conform -> quality gate ---
+        # --- Ingest (bookmarked) -> quality gate -> conform ---
         dyf = read_source(config, glue_context, log)
-        records_read = dyf.count()
+        dyf = quality_gate(dyf, config, glue_context, log)   # operate on raw frame
+        df = conform_to_df(dyf, config, log)                  # -> Spark DataFrame
+
+        records_read = df.count()
         log.info("Records read", count=records_read)
 
-        dyf = conform(dyf, config, glue_context, log)
-        dyf = quality_gate(dyf, config, glue_context, log)
-
-        # --- Create table if missing; capture row count for audit deltas ---
+        # --- Schema reconciliation (Data API), identical semantics to production ---
         if check_table_exists(redshift_conn, config, client):
+            log.info("Target table exists")
+            redshift_df = read_redshift_table_schema(config, redshift_conn, spark, client)
             rows_before = get_row_count(config, redshift_conn, client)
+
+            # check_datatype_matching(redshift_df, df, log)   # parity: optional guard
+
+            if set(df.columns) != set(redshift_df.columns):
+                log.info("Reconciling new/missing columns")
+                df = fill_missing_columns(df, redshift_df, log)          # back-fill target-only
+                alter_redshift_table(config, redshift_conn, df, redshift_df, client, log)  # ADD new
         else:
-            create_new_redshift_table(config, redshift_conn, dyf.toDF(), client, log)
+            create_new_redshift_table(config, redshift_conn, df, client, log)
             rows_before = 0
 
-        # --- Schema evolution (preactions) + single connector load + merge ---
-        preactions, aligned, staging = reconcile_and_build_preactions(
-            dyf, config, redshift_conn, spark, glue_context, client, log)
-        load_and_merge(aligned, preactions, staging, config, redshift_conn, glue_context, log)
+        # widen VARCHAR / promote integers (must precede frame alignment)
+        alter_varchar_columns(config, redshift_conn, df, client, log)
 
-        job.commit()  # persist bookmark state (this is meaningful here, unlike production)
+        # re-read post-evolution schema and align column order (COPY is positional)
+        redshift_df = read_redshift_table_schema(config, redshift_conn, spark, client)
+        df = df.select(*[c.name for c in redshift_df.schema.fields])
+
+        # --- Load + upsert via the connector (staging + COPY + merge in one call) ---
+        aligned = DynamicFrame.fromDF(df, glue_context, "aligned")
+        load_and_merge(aligned, config, redshift_conn, glue_context, log)
+
+        job.commit()  # persist bookmark state (meaningful here, unlike production)
 
         # --- Audit + archive + logs ---
         rows_after = get_row_count(config, redshift_conn, client)
@@ -626,7 +839,7 @@ def main():
             records_read, records_updated, records_inserted, "SUCCESS", "NULL", client)
         log.info("ETL Job Completed Successfully")
 
-        _move_s3_file(config, s3_archive_path, log)
+        move_s3_file_to_archive(config, s3_archive_path, log)
         log.export_to_s3(config['src_bucket'], f"logs/{now.strftime('%Y/%m/%d')}", log_base_name)
 
     except Exception as e:
@@ -634,14 +847,15 @@ def main():
         traceback.print_exc()
         try:
             run_end_ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            fail_records_read = records_read if 'records_read' in dir() else 0
             update_job_sts_table(
                 config, redshift_conn, run_start_ts, run_end_ts, source_filename,
-                records_read, 0, 0, "FAILED", str(e), client)
+                fail_records_read, 0, 0, "FAILED", str(e), client)
         except Exception as audit_ex:
             log.error("Failed to record job status", error=str(audit_ex))
         finally:
             try:
-                _move_s3_file(config, s3_unprocessed_path, log)
+                move_s3_file_to_unprocessed(config, s3_unprocessed_path, log)
                 log.export_to_s3(config['src_bucket'], f"logs/{now.strftime('%Y/%m/%d')}", log_base_name)
             except Exception:
                 pass

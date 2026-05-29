@@ -533,21 +533,37 @@ This is the **only** configuration with hands-off, end-to-end schema evolution.
 
 ### 8.4 End-to-end skeleton
 
+This is the shape implemented in the runnable reference
+[`glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py`](../../glue_jobs/dynamicframe_variant/glue_job_dynamicframe.py)
+(full parity with the simple `without_data_model` job). Note the ordering: **schema
+evolution runs via the Data API *before* the load**, because integer promotion reorders
+Redshift columns and `COPY` is positional — so the frame must be aligned to the
+post-evolution schema before the connector writes it.
+
 ```python
 def main_dynamic():
     spark, glueContext, job = initialize_glue(config["job_name"])
-    dyf = read_source(config, glueContext)              # §7.2 ingest + bookmarks
-    dyf = conform(dyf, config)                           # §8.1 resolveChoice + apply_mapping
-    dyf = add_audit_fields(dyf)                          # run_date / file_name
-    dyf = quality_gate(dyf, config)                      # §7.6 errors → quarantine
+    dyf = read_source(config, glueContext)               # §7.2 ingest + bookmarks
+    dyf = quality_gate(dyf, config, glueContext, log)     # §7.6 errors → quarantine (raw frame)
+    df  = conform_to_df(dyf, config, log)                 # §8.1 resolveChoice + cast + audit cols
+
     if check_table_exists(redshift_conn, config, client):
-        load_and_merge(dyf, config, redshift_conn, client)   # §8.2
+        redshift_df = read_redshift_table_schema(config, redshift_conn, spark, client)
+        if set(df.columns) != set(redshift_df.columns):   # §4.2–4.3 additive evolution
+            df = fill_missing_columns(df, redshift_df, log)
+            alter_redshift_table(config, redshift_conn, df, redshift_df, client, log)
     else:
-        create_new_redshift_table(config, redshift_conn, dyf.toDF(), client, log)
-        load_and_merge(dyf, config, redshift_conn, client)
-    process_dimensional_model(dyf, config, redshift_conn)    # §7.8 (data-model job)
-    update_job_sts_table(...)                            # §7.7 unchanged
-    job.commit()                                          # persist bookmark (§9)
+        create_new_redshift_table(config, redshift_conn, df, client, log)
+
+    alter_varchar_columns(config, redshift_conn, df, client, log)   # §4.4 widen / promote ints
+    redshift_df = read_redshift_table_schema(config, redshift_conn, spark, client)
+    df = df.select(*[c.name for c in redshift_df.schema.fields])    # §4.5 positional alignment
+
+    aligned = DynamicFrame.fromDF(df, glueContext, "aligned")
+    load_and_merge(aligned, config, redshift_conn, glueContext, log)  # §8.2 staging+COPY+merge
+    update_job_sts_table(...)                             # §7.7 unchanged
+    job.commit()                                          # §9 persist bookmark
+    # data-model variant would additionally call process_dimensional_model(...) here (§7.8)
 ```
 
 ### 8.5 Gains vs costs of the rebuild

@@ -17,15 +17,27 @@ the ETL on AWS Glue **DynamicFrames**, implementing the design in
 | Type ambiguity | n/a (fixed schema) | `resolveChoice` resolves `choice` columns |
 | Typing rule | `cast_like` (non-key `double → DECIMAL(38,18)`) | **Same** `cast_like` rule, reused |
 | Bad records | exception | `errorsAsDynamicFrame()` → quarantined to `data/quarantine/` |
-| Schema evolution | `ALTER`/back-fill/widen via Data API | Same logic, emitted as connector **`preactions`** |
+| Schema evolution | `ALTER`/back-fill/widen/promote via Data API | **Same logic, same Data API**, run up-front (before the load) |
 | Load path | `coalesce(1).write` + create-staging + COPY + `run_merge` | **One** `write_dynamic_frame` (connector) with `preactions` + `postactions` |
+| Staging create | `CALL sp_create_staging_table` | **Same SP**, run as a `preaction` |
 | Merge | `CALL sp_merge_from_staging` | **Same SP**, run as a `postaction` |
 | Redshift access | Redshift **Data API** (no VPC) | Data API for schema/audit **+** JDBC **Glue Connection** for the connector load |
 
-The schema-evolution semantics are identical to production (additive only — see doc
-Section 4): new source columns are added, target-only columns are back-filled, and
-`VARCHAR` columns are widened. Integer promotion and view drop/recreate are intentionally
-left as a documented extension point in `reconcile_and_build_preactions()`.
+The schema-evolution semantics are **full parity** with the simple production job (additive
+only — see doc Section 4): new source columns are added (`ALTER TABLE ADD COLUMN`),
+target-only columns are back-filled, `VARCHAR` columns are widened, and integers are
+promoted `SMALLINT → INTEGER → BIGINT` — each wrapped in view drop/recreate because
+Redshift views bind to their table. Schema evolution runs via the Redshift Data API
+**before** the connector load, because integer promotion reorders columns and `COPY` is
+positional (the frame is aligned to the post-evolution schema first).
+
+**Bug fixed vs production:** production `alter_redshift_table` compares the Redshift schema
+against itself, so genuinely new source columns are never added (silently dropped). This
+variant compares the source frame against the target and adds the missing columns — the
+intended behaviour. The production scripts are left as-is.
+
+**Scope:** this mirrors the simple (`without_data_model`) job only. The star-schema
+dimensional model (`with_data_model`) is not implemented here.
 
 ## Prerequisites (beyond the production jobs)
 
